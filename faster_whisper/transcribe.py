@@ -13,6 +13,8 @@ from warnings import warn
 import ctranslate2
 import numpy as np
 import tokenizers
+import pandas as pd
+import soundfile as sf
 
 from tqdm import tqdm
 
@@ -96,6 +98,7 @@ class TranscriptionOptions:
     clip_timestamps: Union[str, List[float]]
     hallucination_silence_threshold: Optional[float]
     hotwords: Optional[str]
+    unhallucinated: bool = False
 
 
 @dataclass
@@ -297,6 +300,7 @@ class BatchedInferencePipeline:
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
+        unhallucinated: bool = False,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """transcribe audio in chunks in batched fashion and return with language info.
 
@@ -521,6 +525,7 @@ class BatchedInferencePipeline:
             multilingual=multilingual,
             without_timestamps=without_timestamps,
             max_initial_timestamp=0.0,
+            unhallucinated=unhallucinated,
         )
 
         info = TranscriptionInfo(
@@ -598,6 +603,7 @@ class WhisperModel:
         files: dict = None,
         revision: Optional[str] = None,
         use_auth_token: Optional[Union[str, bool]] = None,
+        marker_metadata_path: Optional[str] = None,
         **model_kwargs,
     ):
         """Initializes the Whisper model.
@@ -634,8 +640,16 @@ class WhisperModel:
             commit hash.
           use_auth_token: HuggingFace authentication token or True to use the
             token stored by the HuggingFace config folder.
+          marker_metadata_path: Path to the CSV file containing marker metadata.
         """
+
+        self.marker_prefix = "Zebra blue seven box jump. "
+
         self.logger = get_logger()
+        self.marker_metadata = None
+        if marker_metadata_path:
+            self.marker_metadata = load_marker_metadata(marker_metadata_path)
+            self.marker_audio_cache = {}
 
         tokenizer_bytes, preprocessor_bytes = None, None
         if files:
@@ -755,6 +769,7 @@ class WhisperModel:
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
+        unhallucinated: bool = False,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -967,6 +982,7 @@ class WhisperModel:
             clip_timestamps=clip_timestamps,
             hallucination_silence_threshold=hallucination_silence_threshold,
             hotwords=hotwords,
+            unhallucinated=unhallucinated,
         )
 
         segments = self.generate_segments(
@@ -1144,6 +1160,28 @@ class WhisperModel:
             )
             segment = features[:, seek : seek + segment_size]
             segment_duration = segment_size * self.feature_extractor.time_per_frame
+
+            # Insert marker audio if available and unhallucinated is True
+
+            if options.unhallucinated and self.marker_metadata and tokenizer.language_code in self.marker_metadata:
+                marker_info = self.marker_metadata[tokenizer.language_code]
+                if marker_info['file_path'] not in self.marker_audio_cache:
+                    self.marker_audio_cache[marker_info['file_path']] = load_marker_audio(
+                        marker_info['file_path'], 
+                        self.feature_extractor.sampling_rate
+                    )
+                marker_audio = self.marker_audio_cache[marker_info['file_path']]
+                marker_features = self.feature_extractor(marker_audio)
+                # Concatenate marker features with segment features
+                segment = np.concatenate([marker_features, segment], axis=1)
+                segment_duration += marker_info['duration']
+                
+                # Add English prefix for the marker
+                if options.prefix is None:
+                    options.prefix = self.marker_prefix
+                else:
+                    options.prefix = self.marker_prefix + options.prefix
+
             segment = pad_or_trim(segment)
 
             if self.logger.isEnabledFor(logging.DEBUG):
@@ -1314,6 +1352,16 @@ class WhisperModel:
 
                 if segment["start"] == segment["end"] or not text.strip():
                     continue
+
+                # Check for marker prefix in the transcription
+                if options.unhallucinated and text.strip().startswith(self.marker_prefix.strip()):
+                    print("MARKER FOUND in segment starting at", format_timestamp(segment["start"]) , 'NO HALLUCINATION')
+                    # Remove the marker prefix from the text
+                    text = text.strip().replace(self.marker_prefix.strip(), "", 1).strip()
+                    # Update the segment text
+                    segment["text"] = text
+                else:
+                    print("MARKER NOT FOUND in segment starting at", format_timestamp(segment["start"]),"HALLUCINATION DETECTED")
 
                 all_tokens.extend(tokens)
                 idx += 1
@@ -1905,3 +1953,15 @@ def merge_punctuations(alignment: List[dict], prepended: str, appended: str) -> 
         else:
             i = j
         j += 1
+
+
+def load_marker_metadata(csv_path):
+    """Load marker metadata from CSV file."""
+    df = pd.read_csv(csv_path)
+    return {row['language']: {'file_path': row['file_path'], 'duration': row['duration_sec']} 
+            for _, row in df.iterrows()}
+
+def load_marker_audio(file_path, sampling_rate):
+    """Load marker audio file."""
+    audio, _ = sf.read(file_path)
+    return audio
