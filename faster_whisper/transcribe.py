@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import zlib
+import time
 
 from dataclasses import asdict, dataclass
 from inspect import signature
@@ -29,7 +30,9 @@ from faster_whisper.vad import (
     get_speech_timestamps,
     merge_segments,
 )
+from faster_whisper.color_output import print_colored_segment
 
+from faster_whisper.metrics import get_compression_rate, get_ngrams, get_ngram_score
 
 @dataclass
 class Word:
@@ -99,6 +102,8 @@ class TranscriptionOptions:
     hallucination_silence_threshold: Optional[float]
     hotwords: Optional[str]
     unhallucinated: bool = False
+    use_compressor: bool = False
+    transition_frames: int = 10
 
 
 @dataclass
@@ -301,6 +306,9 @@ class BatchedInferencePipeline:
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
         unhallucinated: bool = False,
+        use_compressor: bool = False,
+        transition_frames: int = 10,
+        log_probs_file: str = "experiments/log_probs.csv",
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """transcribe audio in chunks in batched fashion and return with language info.
 
@@ -434,6 +442,7 @@ class BatchedInferencePipeline:
             format_timestamp(duration - duration_after_vad),
         )
 
+        #using VAD
         audio_chunks, chunks_metadata = collect_chunks(audio, clip_timestamps)
         features = (
             [self.model.feature_extractor(chunk)[..., :-1] for chunk in audio_chunks]
@@ -526,6 +535,8 @@ class BatchedInferencePipeline:
             without_timestamps=without_timestamps,
             max_initial_timestamp=0.0,
             unhallucinated=unhallucinated,
+            use_compressor=use_compressor,
+            transition_frames=transition_frames,
         )
 
         info = TranscriptionInfo(
@@ -547,7 +558,13 @@ class BatchedInferencePipeline:
             log_progress,
         )
 
-        return segments, info
+        # Create a wrapper generator that prints colored output
+        def colored_segments_generator():
+            for segment in segments:
+                print_colored_segment(segment)
+                yield segment
+
+        return colored_segments_generator(), info
 
     def _batched_segments_generator(
         self, features, tokenizer, chunks_metadata, batch_size, options, log_progress
@@ -770,6 +787,9 @@ class WhisperModel:
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
         unhallucinated: bool = False,
+        use_compressor: bool = False,
+        transition_frames: int = 10,
+        log_probs_file: str = "experiments/log_probs.csv",
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -854,6 +874,7 @@ class WhisperModel:
             )
             multilingual = False
 
+        #load the audio and prepare for transcription
         if not isinstance(audio, np.ndarray):
             audio = decode_audio(audio, sampling_rate=sampling_rate)
 
@@ -863,6 +884,7 @@ class WhisperModel:
         self.logger.info(
             "Processing audio with duration %s", format_timestamp(duration)
         )
+
 
         if vad_filter and clip_timestamps == "0":
             if vad_parameters is None:
@@ -894,6 +916,7 @@ class WhisperModel:
 
         else:
             speech_chunks = None
+
 
         features = self.feature_extractor(audio, chunk_length=chunk_length)
 
@@ -942,6 +965,9 @@ class WhisperModel:
 
             language_probability = 1
 
+        if unhallucinated:
+            initial_prompt=self.get_initial_prompt(language='en')
+
         tokenizer = Tokenizer(
             self.hf_tokenizer,
             self.model.is_multilingual,
@@ -983,10 +1009,12 @@ class WhisperModel:
             hallucination_silence_threshold=hallucination_silence_threshold,
             hotwords=hotwords,
             unhallucinated=unhallucinated,
+            use_compressor=use_compressor,
+            transition_frames=transition_frames,
         )
 
         segments = self.generate_segments(
-            features, tokenizer, options, log_progress, encoder_output
+            features, tokenizer, options, log_progress, encoder_output, log_probs_file
         )
 
         if speech_chunks:
@@ -1002,7 +1030,13 @@ class WhisperModel:
             all_language_probs=all_language_probs,
         )
 
-        return segments, info
+        # Create a wrapper generator that prints colored output
+        def colored_segments_generator():
+            for segment in segments:
+                print_colored_segment(segment)
+                yield segment
+
+        return colored_segments_generator(), info
 
     def _split_segments_by_timestamps(
         self,
@@ -1090,7 +1124,20 @@ class WhisperModel:
         options: TranscriptionOptions,
         log_progress,
         encoder_output: Optional[ctranslate2.StorageView] = None,
+        log_probs_file: str = "experiments/log_probs.csv",
     ) -> Iterable[Segment]:
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(log_probs_file), exist_ok=True)
+        
+        # Check if file exists to write header
+        file_exists = os.path.isfile(log_probs_file)
+        
+        with open(log_probs_file, 'a', encoding='utf-8', newline='') as f:
+            import csv
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["timestamp", "text", "avg_log_prob", "no_speech_prob", "compression_rate", "ngram_score"])
+
         content_frames = features.shape[-1] - 1
         content_duration = float(content_frames * self.feature_extractor.time_per_frame)
 
@@ -1115,7 +1162,7 @@ class WhisperModel:
             zip(seek_points[::2], seek_points[1::2])
         )
 
-        punctuation = "\"'“¿([{-\"'.。,，!！?？:：”)]}、"
+        punctuation = "\"'¿([{-\"'.。,，!！?？:："
 
         idx = 0
         clip_idx = 0
@@ -1172,8 +1219,24 @@ class WhisperModel:
                     )
                 marker_audio = self.marker_audio_cache[marker_info['file_path']]
                 marker_features = self.feature_extractor(marker_audio)
+                
+                # Apply compression if enabled
+                if options.use_compressor:
+                    marker_features = apply_spectrogram_compression(
+                        marker_features, 
+                        transition_frames=options.transition_frames
+                    )
+                
                 # Concatenate marker features with segment features
                 segment = np.concatenate([marker_features, segment], axis=1)
+                
+                # Apply compression to the transition region if enabled
+                if options.use_compressor:
+                    segment = apply_spectrogram_compression(
+                        segment, 
+                        transition_frames=options.transition_frames
+                    )
+                
                 segment_duration += marker_info['duration']
                 
                 # Add English prefix for the marker
@@ -1240,8 +1303,109 @@ class WhisperModel:
                     continue
 
             tokens = result.sequences_ids[0]
-
             previous_seek = seek
+
+            # Log token probabilities for all transcriptions
+            text = tokenizer.decode(tokens).strip()
+            os.makedirs(os.path.dirname(log_probs_file), exist_ok=True)
+            
+            # Check if file exists to write header
+            file_exists = os.path.isfile(log_probs_file)
+            
+            # Calculate metrics for the chunk
+            compression_rate = get_compression_ratio(text)
+            ngrams = get_ngrams(text)
+            ngram_score = get_ngram_score(ngrams)
+            
+            # Known statistics
+            mean = np.array([81.3, 12.09])
+            cov = np.array([[1488.716, 165.922], [165.922, 25.878]])
+            cov_inv = np.linalg.inv(cov)
+
+            # New data point
+            x = np.array([ngram_score, compression_rate])
+            distance = mahalanobis_distance(x, mean, cov_inv)
+
+            # Threshold (tune as needed)
+            if distance < 1.5:
+                print("HALLUCINATION DETECTED distance: ", distance)
+
+            with open(log_probs_file, 'a', encoding='utf-8', newline='') as f:
+                import csv
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["timestamp", "text", "avg_log_prob", "no_speech_prob", "compression_rate", "ngram_score"])
+                # Write metrics in CSV format
+                writer.writerow([
+                    format_timestamp(time_offset),
+                    text,
+                    f"{avg_logprob:.4f}",
+                    f"{result.no_speech_prob:.4f}",
+                    f"{compression_rate:.4f}",
+                    f"{ngram_score:.4f}"
+                ])
+
+            # Check if marker was detected in the transcription
+            if options.unhallucinated:
+                marker_detected = text.strip().startswith(self.marker_prefix.strip())
+                
+                if not marker_detected:
+                    # If marker not detected, retry without marker
+                    self.logger.debug("Marker not detected, retrying without marker")
+                    
+                    # Remove marker features and prefix
+                    if options.prefix and options.prefix.startswith(self.marker_prefix):
+                        options.prefix = options.prefix[len(self.marker_prefix):].strip()
+                    
+                    # Re-encode without marker
+                    if seek > 0 or encoder_output is None:
+                        encoder_output = self.encode(segment)
+                    
+                    prompt = self.get_prompt(
+                        tokenizer,
+                        previous_tokens,
+                        without_timestamps=options.without_timestamps,
+                        prefix=options.prefix if seek == 0 else None,
+                        hotwords=options.hotwords,
+                    )
+                    
+                    result, avg_logprob, temperature, compression_ratio = self.generate_with_fallback(
+                        encoder_output, prompt, tokenizer, options
+                    )
+                    tokens = result.sequences_ids[0]
+                    
+                    # Log token probabilities for retry without marker
+                    with open(log_probs_file, 'a', encoding='utf-8', newline='') as f:
+                        writer = csv.writer(f)
+                        
+                        # Calculate metrics
+                        compression_rate = get_compression_rate(text)
+                        ngrams = get_ngrams(text)
+                        ngram_score = get_ngram_score(ngrams)
+                        
+                        # Known statistics
+                        mean = np.array([81.3, 12.09])
+                        cov = np.array([[1488.716, 165.922], [165.922, 25.878]])
+                        cov_inv = np.linalg.inv(cov)
+
+                        # New data point
+                        x = np.array([ngram_score, compression_rate])
+                        distance = mahalanobis_distance(x, mean, cov_inv)
+                        print("DISTANCE: ", distance)
+
+                        # Threshold (tune as needed)
+                        if distance > 4:
+                            print("HALLUCINATION DETECTED")
+                        
+                        # Write metrics in CSV format with retry indicator
+                        writer.writerow([
+                            format_timestamp(time_offset),
+                            f"[RETRY] {text}",
+                            f"{avg_logprob:.4f}",
+                            f"{result.no_speech_prob:.4f}", 
+                            f"{compression_rate:.4f}",
+                            f"{ngram_score:.4f}"
+                        ])
 
             # anomalous words are very long/short/improbable
             def word_anomaly_score(word: dict) -> float:
@@ -1355,13 +1519,11 @@ class WhisperModel:
 
                 # Check for marker prefix in the transcription
                 if options.unhallucinated and text.strip().startswith(self.marker_prefix.strip()):
-                    print("MARKER FOUND in segment starting at", format_timestamp(segment["start"]) , 'NO HALLUCINATION')
                     # Remove the marker prefix from the text
                     text = text.strip().replace(self.marker_prefix.strip(), "", 1).strip()
                     # Update the segment text
                     segment["text"] = text
-                else:
-                    print("MARKER NOT FOUND in segment starting at", format_timestamp(segment["start"]),"HALLUCINATION DETECTED")
+
 
                 all_tokens.extend(tokens)
                 idx += 1
@@ -1482,6 +1644,7 @@ class WhisperModel:
 
             text = tokenizer.decode(tokens).strip()
             compression_ratio = get_compression_ratio(text)
+
 
             decode_result = (
                 result,
@@ -1855,6 +2018,56 @@ class WhisperModel:
 
         return language, language_probability, all_language_probs
 
+    def get_initial_prompt(self, language):
+        if language == "en":
+            return "Ok, Translation. "\
+            +"The following is a video to be translated to english from either russian, ukrainian, chinese, korean, or arabic. "\
+            +"zebra blue seven box jump. zebra blue seven box jump. zebra blue seven box jump. "\
+            +"Please find here, an unlikely ordinary sentence. "\
+            +"This is to avoid a repetition to be deleted. "\
+            +"zebra blue seven box jump. "
+
+        if language == "ar":
+            return "ترجمة، حسنًا. "\
+            +"فيما يلي فيديو سيتم ترجمته إلى الإنجليزية من الروسية أو الأوكرانية أو الصينية أو الكورية أو العربية. "\
+            +"حمار وحشي أزرق سبعة صندوق اقفز. حمار وحشي أزرق سبعة صندوق اقفز. حمار وحشي أزرق سبعة صندوق اقفز. "\
+            +"يرجى العثور هنا على جملة عادية غير متوقعة. "\
+            +"هذا لتفادي حذف التكرار. "\
+            +"حمار وحشي أزرق سبعة صندوق اقفز. "
+
+        if language == "ru":
+            return "Перевод, хорошо. "\
+            +"Следующее видео предназначено для перевода на английский язык с русского, украинского, китайского, корейского или арабского. "\
+            +"зебра синий семь коробка прыгать. зебра синий семь коробка прыгать. зебра синий семь коробка прыгать. "\
+            +"Пожалуйста, найдите здесь маловероятно обычное предложение. "\
+            +"Это сделано, чтобы избежать удаления повторяющейся фразы. "\
+            +"зебра синий семь коробка прыгать. "
+
+        if language == "uk":
+            return "Переклад, гаразд. "\
+            +"Наступне відео потрібно перекласти англійською з російської, української, китайської, корейської або арабської. "\
+            +"зебра синя сім коробка стрибати. зебра синя сім коробка стрибати. зебра синя сім коробка стрибати. "\
+            +"Будь ласка, знайдіть тут малоймовірно звичайне речення. "\
+            +"Це зроблено для уникнення видалення повтору. "\
+            +"зебра синя сім коробка стрибати. "
+
+        if language == "ko":
+            return "번역, 좋아요. "\
+            +"다음은 러시아어, 우크라이나어, 중국어, 한국어 또는 아랍어에서 영어로 번역할 영상입니다. "\
+            +"얼룩말 파란색 일곱 상자 점프. 얼룩말 파란색 일곱 상자 점프. 얼룩말 파란색 일곱 상자 점프. "\
+            +"여기에서 보기 드문 평범한 문장을 확인해 주세요. "\
+            +"반복 삭제를 피하기 위한 것입니다. "\
+            +"얼룩말 파란색 일곱 상자 점프. "
+
+
+        # if language == "ma":
+            # return "翻译，好的。"\
+        # +"以下是一个YouTube视频的转录内容。"\
+        # +"好的，翻译。翻译，好的。好的，翻译。翻译，好的。"\
+        # +"请在这里找到一个不太可能的普通句子。"\
+        # +"这是为了避免重复内容被删除。"\
+        # +"好的，翻译。"
+
 
 def restore_speech_timestamps(
     segments: Iterable[Segment],
@@ -1965,3 +2178,31 @@ def load_marker_audio(file_path, sampling_rate):
     """Load marker audio file."""
     audio, _ = sf.read(file_path)
     return audio
+
+def apply_spectrogram_compression(spectrogram, transition_frames=10):
+    """Apply compression to smooth transitions in mel spectrogram.
+    
+    Args:
+        spectrogram: Mel spectrogram array of shape (n_mels, n_frames)
+        transition_frames: Number of frames to use for transition smoothing
+        
+    Returns:
+        Compressed spectrogram
+    """
+    n_mels, n_frames = spectrogram.shape
+    
+    # Create a transition window
+    transition = np.linspace(0, 1, transition_frames)
+    transition = np.expand_dims(transition, axis=0)  # Shape: (1, transition_frames)
+    
+    # Apply compression to the transition region
+    if n_frames > transition_frames:
+        # Smooth the transition between marker and segment
+        spectrogram[:, :transition_frames] *= transition
+        spectrogram[:, -transition_frames:] *= transition[::-1]
+    
+    return spectrogram
+
+def mahalanobis_distance(x, mean, cov_inv):
+    diff = x - mean
+    return np.sqrt(diff.T @ cov_inv @ diff)
