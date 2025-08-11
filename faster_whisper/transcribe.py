@@ -1132,18 +1132,27 @@ class WhisperModel:
                 if clip_idx < len(seek_clips):
                     seek = seek_clips[clip_idx][0]
                 continue
+
+            #core segment extraction or chunking
+            #seek is keeping track of what chunk we are processing
             time_offset = seek * self.feature_extractor.time_per_frame
             window_end_time = float(
                 (seek + self.feature_extractor.nb_max_frames)
                 * self.feature_extractor.time_per_frame
-            )
+            ) #nb_max_frames is whats deciding the chunk size
+
+            #determine size of the chunk, never longer than 30s usually shorter by audio or clip boundaries
             segment_size = min(
                 self.feature_extractor.nb_max_frames,
                 content_frames - seek,
                 seek_clip_end - seek,
             )
+
+            #extract mel spectrogram chunk from audio
             segment = features[:, seek : seek + segment_size]
+            #calculate duration of the chunk in seconds
             segment_duration = segment_size * self.feature_extractor.time_per_frame
+            #pad or trim the chunk to 3000 mel features as expected by the encoder
             segment = pad_or_trim(segment)
 
             if self.logger.isEnabledFor(logging.DEBUG):
@@ -1153,6 +1162,7 @@ class WhisperModel:
 
             previous_tokens = all_tokens[prompt_reset_since:]
 
+            #if we are at the start of the audio or we don't have an encoder output yet, encode the chunk
             if seek > 0 or encoder_output is None:
                 encoder_output = self.encode(segment)
 
@@ -1164,6 +1174,7 @@ class WhisperModel:
                 tokenizer.language = tokenizer.tokenizer.token_to_id(language_token)
                 tokenizer.language_code = language
 
+            #generate the prompt for the chunk
             prompt = self.get_prompt(
                 tokenizer,
                 previous_tokens,
@@ -1308,6 +1319,8 @@ class WhisperModel:
                 last_word_end = get_end(current_segments)
                 if last_word_end is not None:
                     last_speech_timestamp = last_word_end
+
+            #output formation in a generator object that is useful for user applications - good for collab
             for segment in current_segments:
                 tokens = segment["tokens"]
                 text = tokenizer.decode(tokens)
@@ -1432,8 +1445,10 @@ class WhisperModel:
             cum_logprob = result.scores[0] * (seq_len**options.length_penalty)
             avg_logprob = cum_logprob / (seq_len + 1)
 
+            #full chunk here.
             text = tokenizer.decode(tokens).strip()
             compression_ratio = get_compression_ratio(text)
+
 
             decode_result = (
                 result,
