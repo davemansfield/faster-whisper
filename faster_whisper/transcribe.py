@@ -13,6 +13,7 @@ from warnings import warn
 import ctranslate2
 import numpy as np
 import tokenizers
+import soundfile as sf
 
 from tqdm import tqdm
 
@@ -28,6 +29,9 @@ from faster_whisper.vad import (
     merge_segments,
 )
 
+from preprocess_pipeline.utils import calculate_all_metrics
+from preprocess_pipeline.enhancement import Enhancer
+import tempfile
 
 @dataclass
 class Word:
@@ -96,6 +100,16 @@ class TranscriptionOptions:
     clip_timestamps: Union[str, List[float]]
     hallucination_silence_threshold: Optional[float]
     hotwords: Optional[str]
+    # Hallucination recovery parameters
+    enable_hallucination_recovery: bool = True
+    max_beam_size: int = 7
+    min_beam_size: int = 3
+    ngram_threshold: float = 20.0
+    compression_threshold: float = 2.0
+    max_recovery_attempts: int = 4
+    red_light: bool = True
+    yellow_light: bool = True
+    green_light: bool = True
 
 
 @dataclass
@@ -297,6 +311,16 @@ class BatchedInferencePipeline:
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
+        # Hallucination recovery parameters
+        enable_hallucination_recovery: bool = True,
+        max_beam_size: int = 7,
+        min_beam_size: int = 3,
+        ngram_threshold: float = 20.0,
+        compression_threshold: float = 2.0,
+        max_recovery_attempts: int = 4,
+        red_light: bool = True,
+        yellow_light: bool = True,
+        green_light: bool = True,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """transcribe audio in chunks in batched fashion and return with language info.
 
@@ -387,6 +411,8 @@ class BatchedInferencePipeline:
         if not isinstance(audio, np.ndarray):
             audio = decode_audio(audio, sampling_rate=sampling_rate)
         duration = audio.shape[0] / sampling_rate
+
+
 
         self.model.logger.info(
             "Processing audio with duration %s", format_timestamp(duration)
@@ -509,18 +535,25 @@ class BatchedInferencePipeline:
                 if suppress_tokens
                 else suppress_tokens
             ),
+            without_timestamps=without_timestamps,
+            max_initial_timestamp=max_initial_timestamp,
+            word_timestamps=word_timestamps,
             prepend_punctuations=prepend_punctuations,
             append_punctuations=append_punctuations,
-            max_new_tokens=max_new_tokens,
-            hotwords=hotwords,
-            word_timestamps=word_timestamps,
-            hallucination_silence_threshold=None,
-            condition_on_previous_text=False,
-            clip_timestamps=clip_timestamps,
-            prompt_reset_on_temperature=0.5,
             multilingual=multilingual,
-            without_timestamps=without_timestamps,
-            max_initial_timestamp=0.0,
+            max_new_tokens=max_new_tokens,
+            clip_timestamps=clip_timestamps,
+            hallucination_silence_threshold=hallucination_silence_threshold,
+            hotwords=hotwords,
+            enable_hallucination_recovery=enable_hallucination_recovery,
+            max_beam_size=max_beam_size,
+            min_beam_size=min_beam_size,
+            ngram_threshold=ngram_threshold,
+            compression_threshold=compression_threshold,
+            max_recovery_attempts=max_recovery_attempts,
+            red_light=red_light,
+            yellow_light=yellow_light,
+            green_light=green_light,
         )
 
         info = TranscriptionInfo(
@@ -637,6 +670,15 @@ class WhisperModel:
         """
         self.logger = get_logger()
 
+        # Initialize enhancement model once
+        try:
+            # Create a dummy enhancer to initialize the model
+            self.enhancer = None  # Will be initialized on first use
+            self.enhancement_available = True
+        except ImportError:
+            self.enhancement_available = False
+            print("Enhancement module not available")
+
         tokenizer_bytes, preprocessor_bytes = None, None
         if files:
             model_path = model_size_or_path
@@ -743,8 +785,8 @@ class WhisperModel:
         without_timestamps: bool = False,
         max_initial_timestamp: float = 1.0,
         word_timestamps: bool = False,
-        prepend_punctuations: str = "\"'“¿([{-",
-        append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
+        prepend_punctuations: str = "\"'¿([{-",
+        append_punctuations: str = "\"'.。,，!！?？:：",
         multilingual: bool = False,
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
@@ -755,6 +797,16 @@ class WhisperModel:
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
+        # Hallucination recovery parameters
+        enable_hallucination_recovery: bool = True,
+        max_beam_size: int = 7,
+        min_beam_size: int = 3,
+        ngram_threshold: float = 20.0,
+        compression_threshold: float = 2.0,
+        max_recovery_attempts: int = 4,
+        red_light: bool = True,
+        yellow_light: bool = True,
+        green_light: bool = True,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -841,6 +893,10 @@ class WhisperModel:
 
         if not isinstance(audio, np.ndarray):
             audio = decode_audio(audio, sampling_rate=sampling_rate)
+
+        # Store raw audio for potential enhancement
+        self.raw_audio = audio
+        self.sampling_rate = sampling_rate
 
         duration = audio.shape[0] / sampling_rate
         duration_after_vad = duration
@@ -967,6 +1023,15 @@ class WhisperModel:
             clip_timestamps=clip_timestamps,
             hallucination_silence_threshold=hallucination_silence_threshold,
             hotwords=hotwords,
+            enable_hallucination_recovery=enable_hallucination_recovery,
+            max_beam_size=max_beam_size,
+            min_beam_size=min_beam_size,
+            ngram_threshold=ngram_threshold,
+            compression_threshold=compression_threshold,
+            max_recovery_attempts=max_recovery_attempts,
+            red_light=red_light,
+            yellow_light=yellow_light,
+            green_light=green_light,
         )
 
         segments = self.generate_segments(
@@ -1078,6 +1143,44 @@ class WhisperModel:
         content_frames = features.shape[-1] - 1
         content_duration = float(content_frames * self.feature_extractor.time_per_frame)
 
+        modified_options = TranscriptionOptions(
+            beam_size=options.beam_size,
+            best_of=options.best_of,
+            patience=options.patience,
+            length_penalty=options.length_penalty,
+            repetition_penalty=options.repetition_penalty,
+            no_repeat_ngram_size=options.no_repeat_ngram_size,
+            log_prob_threshold=options.log_prob_threshold,
+            no_speech_threshold=options.no_speech_threshold,
+            compression_ratio_threshold=options.compression_ratio_threshold,
+            condition_on_previous_text=options.condition_on_previous_text,
+            prompt_reset_on_temperature=options.prompt_reset_on_temperature,
+            temperatures=options.temperatures,
+            initial_prompt=options.initial_prompt,
+            prefix=options.prefix,
+            suppress_blank=options.suppress_blank,
+            suppress_tokens=options.suppress_tokens,
+            without_timestamps=options.without_timestamps,
+            max_initial_timestamp=options.max_initial_timestamp,
+            word_timestamps=options.word_timestamps,
+            prepend_punctuations=options.prepend_punctuations,
+            append_punctuations=options.append_punctuations,
+            multilingual=options.multilingual,
+            max_new_tokens=options.max_new_tokens,
+            clip_timestamps=options.clip_timestamps,
+            hallucination_silence_threshold=options.hallucination_silence_threshold,
+            hotwords=options.hotwords,
+            enable_hallucination_recovery=options.enable_hallucination_recovery,
+            max_beam_size=options.max_beam_size,
+            min_beam_size=options.min_beam_size,
+            ngram_threshold=options.ngram_threshold,
+            compression_threshold=options.compression_threshold,
+            max_recovery_attempts=options.max_recovery_attempts,
+            red_light=True,
+            yellow_light=True,
+            green_light=True,
+        )
+        
         if isinstance(options.clip_timestamps, str):
             options.clip_timestamps = [
                 float(ts)
@@ -1155,6 +1258,12 @@ class WhisperModel:
             #pad or trim the chunk to 3000 mel features as expected by the encoder
             segment = pad_or_trim(segment)
 
+            # Extract the corresponding raw audio chunk for this segment
+            current_audio_chunk = self.get_audio_chunk_for_segment(seek, segment_size)
+
+            # # Save the audio chunk as a WAV file for testing
+            # sf.write('audio_test.wav', current_audio_chunk, self.feature_extractor.sampling_rate)
+
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(
                     "Processing segment at %s", format_timestamp(time_offset)
@@ -1183,12 +1292,232 @@ class WhisperModel:
                 hotwords=options.hotwords,
             )
 
-            (
-                result,
-                avg_logprob,
-                temperature,
-                compression_ratio,
-            ) = self.generate_with_fallback(encoder_output, prompt, tokenizer, options)
+            #first generation attempt
+            (result,avg_logprob,temperature,compression_ratio) = self.generate_with_fallback(encoder_output, prompt, tokenizer, options)
+            text = tokenizer.decode(result.sequences_ids[0])
+
+            #check for halluciantion
+            all_Scores=calculate_all_metrics(text)
+            ngram_score=all_Scores['ngram_score']
+            compression_rate=all_Scores['compression_rate']
+
+            recovery_attempts = 0
+            
+            # Use configurable parameters from options
+            max_beam_size = options.max_beam_size
+            min_beam_size = options.min_beam_size
+            hallucination_recovery = options.enable_hallucination_recovery
+            ngram_threshold = options.ngram_threshold
+            compression_threshold = options.compression_threshold
+            max_recovery_attempts = options.max_recovery_attempts
+            red_light = options.red_light
+            yellow_light = options.yellow_light
+            green_light = options.green_light
+            
+            is_hallucination = self.detect_hallucination(ngram_score,compression_rate,
+                ngram_threshold=ngram_threshold,
+                compression_threshold=compression_threshold
+                )
+            
+            #loop until hallucination is fixed or recovery attempts are exhausted
+            while is_hallucination and hallucination_recovery and recovery_attempts < max_recovery_attempts:
+                duration = self.get_segment_duration(seek, segment_size)
+                # Check if segment is too short (less than 1 second) and skip if so
+                if duration < 1.0:
+                    print(f"Skipping chunk at seek {seek} - duration too short: {duration:.2f}s likley to cause hallucination")
+                    seek += segment_size
+                    break
+
+                if recovery_attempts == 0:
+                    #increase beam size and remove context
+                    print("First recovery attempt")
+                    modified_options.condition_on_previous_text = False
+                    modified_options.beam_size = min(options.beam_size + 2,max_beam_size)
+
+                    #generate result, decode and calculate metrics
+                    (result_,avg_logprob_,temperature_,compression_rate_) = self.generate_with_fallback(encoder_output, prompt, tokenizer, modified_options)
+                    text_ = tokenizer.decode(result_.sequences_ids[0])
+                    all_scores_=calculate_all_metrics(text_)
+                    ngram_score_=all_scores_['ngram_score']
+                    compression_rate_=all_scores_['compression_rate']
+
+                    is_hallucination = self.detect_hallucination(ngram_score_,compression_rate_,
+                        ngram_threshold=ngram_threshold,
+                        compression_threshold=compression_threshold
+                        )
+                    
+                    if not is_hallucination:
+                        print("Hallucination fixed with increase beam size!")
+                        # Update result and metrics
+                        result = result_
+                        avg_logprob = avg_logprob_
+                        temperature = temperature_
+                        compression_ratio = compression_rate_
+                        text = text_
+                    
+                    recovery_attempts += 1
+
+                elif recovery_attempts == 1:
+                    #decrease beam size and remove context
+                    print("Second recovery attempt")
+                    modified_options.condition_on_previous_text = False
+                    modified_options.beam_size = max(options.beam_size - 2,min_beam_size)
+
+                    #generate result, decode and calculate metrics
+                    (result_,avg_logprob_,temperature_,compression_rate_) = self.generate_with_fallback(encoder_output, prompt, tokenizer, modified_options)
+                    text_ = tokenizer.decode(result_.sequences_ids[0])
+                    all_scores_=calculate_all_metrics(text_)
+                    ngram_score_=all_scores_['ngram_score']
+                    compression_rate_=all_scores_['compression_rate']
+
+                    is_hallucination = self.detect_hallucination(ngram_score_,compression_rate_,
+                        ngram_threshold=ngram_threshold,
+                        compression_threshold=compression_threshold
+                        )
+                    
+                    if not is_hallucination:
+                        print("Hallucination fixed with decrease beam size!")
+                        # Update result and metrics
+                        result = result_
+                        avg_logprob = avg_logprob_
+                        temperature = temperature_
+                        compression_ratio = compression_rate_
+                        text = text_
+                    
+                    recovery_attempts += 1
+
+                elif recovery_attempts == 2:
+                    print("Third recovery attempt - VAD-based Audio Cleaning")
+                    
+                    # Apply VAD to clean the audio chunk
+                    vad_parameters = VadOptions(max_speech_duration_s=3000, min_silence_duration_ms=160)
+                    speech_chunks = get_speech_timestamps(current_audio_chunk, vad_parameters)
+                    audio_chunks, chunks_metadata = collect_chunks(current_audio_chunk, speech_chunks)
+                    cleaned_audio = np.concatenate(audio_chunks, axis=0)
+                    
+                    # Calculate new duration and adjust parameters
+                    cleaned_duration = cleaned_audio.shape[0] / self.sampling_rate
+                    print(f"VAD reduced audio from {current_audio_chunk.shape[0]/self.sampling_rate:.2f}s to {cleaned_duration:.2f}s")
+                    
+                    # Convert cleaned audio to features
+                    cleaned_features = self.convert_audio_to_features(cleaned_audio)
+                    
+                    # Adjust segment size for the cleaned features
+                    cleaned_segment_size = min(
+                        cleaned_features.shape[-1],  # Use actual feature length
+                        self.feature_extractor.nb_max_frames
+                    )
+                    
+                    # Pad or trim cleaned features to expected size - so that seek is not affected
+                    cleaned_segment = pad_or_trim(cleaned_features)
+                    
+                    # Encode the cleaned features
+                    cleaned_encoder_output = self.encode(cleaned_segment)
+                    
+                    # Generate result with cleaned audio, decode and calculate metrics
+                    (result_, avg_logprob_, temperature_, compression_rate_) = self.generate_with_fallback(
+                        cleaned_encoder_output, prompt, tokenizer, modified_options
+                    )
+                    text_ = tokenizer.decode(result_.sequences_ids[0])
+                    all_scores_ = calculate_all_metrics(text_)
+                    ngram_score_ = all_scores_['ngram_score']
+                    compression_rate_ = all_scores_['compression_rate']
+                    
+                    # Check if hallucination is fixed
+                    is_hallucination = self.detect_hallucination(
+                        ngram_score_, compression_rate_, 
+                        ngram_threshold=ngram_threshold,
+                        compression_threshold=compression_threshold
+                    )
+                    
+                    if not is_hallucination:
+                        print("Hallucination fixed with VAD cleaning!")
+                        # Update result and metrics
+                        result = result_
+                        avg_logprob = avg_logprob_
+                        temperature = temperature_
+                        compression_ratio = compression_rate_
+                        text = text_
+                    
+                    recovery_attempts += 1
+
+                elif recovery_attempts == 3:
+                    print("Fourth recovery attempt - Audio Enhancement with Convtasnet")
+                    
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                        temp_audio_path = temp_file.name
+                        sf.write(temp_audio_path, current_audio_chunk, self.sampling_rate)
+                    
+                    try:
+                        # Enhance the audio using Convtasnet
+                        enhancer = Enhancer(temp_audio_path, 'convtasnet')
+                        enhanced_audio_tensor = enhancer.get_enhanced_audio()
+                        
+                        # Convert tensor to numpy array
+                        enhanced_audio_chunk = enhanced_audio_tensor.squeeze().detach().cpu().numpy()
+                        sf.write('enhanced_audio_chunk.wav', enhanced_audio_chunk, self.sampling_rate) #TEST
+                        
+                        # Clean up enhancement model memory
+                        del enhanced_audio_tensor
+                        del enhancer
+                        
+                        # Force garbage collection and clear GPU cache - stop memory leak caused by reusing enhancing model
+                        import gc
+                        gc.collect()
+                        try:
+                            import torch
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except ImportError:
+                            pass
+                        
+                        # Convert enhanced audio back to features and encode
+                        enhanced_features = self.convert_audio_to_features(enhanced_audio_chunk)
+                        enhanced_encoder_output = self.encode(enhanced_features)
+                        
+                        # Generate result with enhanced audio, decode and calculate metrics
+                        (result_, avg_logprob_, temperature_, compression_rate_) = self.generate_with_fallback(
+                            enhanced_encoder_output, prompt, tokenizer, modified_options
+                        )
+                        text_ = tokenizer.decode(result_.sequences_ids[0])
+                        all_scores_ = calculate_all_metrics(text_)
+                        ngram_score_ = all_scores_['ngram_score']
+                        compression_rate_ = all_scores_['compression_rate']
+                        
+                        # Check if hallucination is fixed
+                        is_hallucination = self.detect_hallucination(
+                            ngram_score_, compression_rate_, 
+                           ngram_threshold=ngram_threshold,compression_threshold=compression_threshold
+                        )
+                        
+                        if not is_hallucination:
+                            print("Hallucination fixed with audio enhancement!")
+                            # Update result and metrics
+                            result = result_
+                            avg_logprob = avg_logprob_
+                            temperature = temperature_
+                            compression_ratio = compression_rate_
+                            text = text_
+                        
+                        recovery_attempts += 1
+                        
+                    except Exception as e:
+                        print(f"Audio enhancement failed: {e}")
+                        recovery_attempts += 1
+                    finally:
+                        # Clean up temporary file
+                        import os
+                        if os.path.exists(temp_audio_path):
+                            os.unlink(temp_audio_path)
+
+                else:
+                    print("recovery attempts exhausted")
+                    modified_options=options # reset options to original before stopping loop
+                    break
+                
+                #reset options between attempts
+                modified_options=options
+       
 
             if options.no_speech_threshold is not None:
                 # no voice activity check
@@ -1511,6 +1840,33 @@ class WhisperModel:
 
         return decode_result
 
+
+
+    def detect_hallucination(self, ngram_score: float, compression_rate: float, 
+                                ngram_threshold: float = 90.0, 
+                                compression_threshold: float = 15.0) -> bool:
+        """
+        Detect hallucination using simple threshold-based approach.
+        
+        Args:
+            ngram_score: N-gram score from metrics
+            compression_rate: Compression rate from metrics
+            ngram_threshold: Threshold for n-gram score (high values indicate repetition)
+            compression_threshold: Threshold for compression rate (high values indicate repetition)
+            is_chunk_level: Whether this is chunk-level detection (uses different thresholds)
+            
+        Returns:
+            bool: True if hallucination detected, False otherwise
+        """
+        
+        # Hallucination is detected if BOTH thresholds are exceeded
+        # High n-gram score indicates repetitive/unusual text patterns
+        # High compression rate indicates highly repetitive content
+        is_hallucination = ngram_score > ngram_threshold or compression_rate > compression_threshold
+        
+        
+        return is_hallucination
+
     def get_prompt(
         self,
         tokenizer: Tokenizer,
@@ -1821,6 +2177,65 @@ class WhisperModel:
             language_probability = max(detected_language_info[language])
 
         return language, language_probability, all_language_probs
+
+
+    def get_audio_chunk_for_segment(self, seek: int, segment_size: int) -> np.ndarray:
+        """
+        Extract the exact raw audio chunk corresponding to a mel spectrogram segment.
+        
+        Args:
+            seek: Starting mel frame index
+            segment_size: Number of mel frames in the segment
+            
+        Returns:
+            Raw audio chunk as numpy array
+        """
+        # Convert mel frame indices to audio sample indices
+        audio_start_sample = int(seek * self.feature_extractor.hop_length)
+        audio_end_sample = int((seek + segment_size) * self.feature_extractor.hop_length)
+        
+        # Extract the audio chunk
+        audio_chunk = self.raw_audio[audio_start_sample:audio_end_sample]
+        
+        return audio_chunk
+
+    def convert_audio_to_features(self, enhanced_audio_chunk: np.ndarray) -> np.ndarray:
+        """
+        Convert audio chunk back to mel spectrogram features.
+        
+        Args:
+            audio_chunk: Enhanced raw audio chunk as numpy array
+            
+        Returns:
+            Mel spectrogram features as numpy array, padded/trimmed to expected size
+        """
+        # Extract mel features from the enhanced audio using the model's feature extractor
+        features = self.feature_extractor(enhanced_audio_chunk)
+        
+        # Pad or trim to the expected size (usually 3000 mel frames)
+        features = pad_or_trim(features)
+        
+        return features
+
+    def get_segment_duration(self, seek: int, segment_size: int) -> float:
+        """
+        Calculate the duration in seconds of the current audio segment.
+        
+        Args:
+            seek: Starting mel frame index
+            segment_size: Number of mel frames in the segment
+            
+        Returns:
+            Duration of the segment in seconds
+        """
+        # Convert mel frame indices to audio sample indices
+        audio_start_sample = int(seek * self.feature_extractor.hop_length)
+        audio_end_sample = int((seek + segment_size) * self.feature_extractor.hop_length)
+        
+        # Calculate duration in seconds
+        duration_seconds = (audio_end_sample - audio_start_sample) / self.sampling_rate
+        
+        return duration_seconds
 
 
 def restore_speech_timestamps(
