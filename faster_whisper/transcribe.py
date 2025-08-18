@@ -32,6 +32,7 @@ from faster_whisper.vad import (
 from preprocess_pipeline.utils import calculate_all_metrics
 from preprocess_pipeline.enhancement import Enhancer
 import tempfile
+from pathlib import Path
 
 @dataclass
 class Word:
@@ -884,6 +885,14 @@ class WhisperModel:
         """
         sampling_rate = self.feature_extractor.sampling_rate
 
+        # Store the original audio filename for chunk naming
+        # Only set if not already set (e.g., from external call)
+        if not hasattr(self, 'original_audio_filename') or self.original_audio_filename is None:
+            if isinstance(audio, str):
+                self.original_audio_filename = Path(audio).stem  # Get filename without extension
+            else:
+                self.original_audio_filename = "unknown_audio"
+
         if multilingual and not self.model.is_multilingual:
             self.logger.warning(
                 "The current model is English-only but the multilingual parameter is set to"
@@ -1319,205 +1328,73 @@ class WhisperModel:
                 compression_threshold=compression_threshold
                 )
             
-            #loop until hallucination is fixed or recovery attempts are exhausted
-            while is_hallucination and hallucination_recovery and recovery_attempts < max_recovery_attempts:
-                duration = self.get_segment_duration(seek, segment_size)
-                # Check if segment is too short (less than 1 second) and skip if so
-                if duration < 1.0:
-                    print(f"Skipping chunk at seek {seek} - duration too short: {duration:.2f}s likley to cause hallucination")
-                    seek += segment_size
-                    break
+            if is_hallucination:
+                #loop until hallucination is fixed or recovery attempts are exhausted
+                while is_hallucination and hallucination_recovery and recovery_attempts < max_recovery_attempts:
+                    duration = self.get_segment_duration(seek, segment_size)
+                    # Check if segment is too short (less than 1 second) and skip if so
+                    if duration < 1.0:
+                        print(f"Skipping chunk at seek {seek} - duration too short: {duration:.2f}s likley to cause hallucination")
+                        seek += segment_size
+                        break
 
-                if recovery_attempts == 0:
-                    #increase beam size and remove context
-                    print("First recovery attempt")
-                    modified_options.condition_on_previous_text = False
-                    modified_options.beam_size = min(options.beam_size + 2,max_beam_size)
-
-                    #generate result, decode and calculate metrics
-                    (result_,avg_logprob_,temperature_,compression_rate_) = self.generate_with_fallback(encoder_output, prompt, tokenizer, modified_options)
-                    text_ = tokenizer.decode(result_.sequences_ids[0])
-                    all_scores_=calculate_all_metrics(text_)
-                    ngram_score_=all_scores_['ngram_score']
-                    compression_rate_=all_scores_['compression_rate']
-
-                    is_hallucination = self.detect_hallucination(ngram_score_,compression_rate_,
-                        ngram_threshold=ngram_threshold,
-                        compression_threshold=compression_threshold
+                    # Apply recovery strategy based on attempt number
+                    if recovery_attempts == 0:
+                        # First recovery attempt: increase beam size
+                        result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_increase_beam_size(
+                            encoder_output, prompt, tokenizer, modified_options
                         )
-                    
-                    if not is_hallucination:
-                        print("Hallucination fixed with increase beam size!")
-                        # Update result and metrics
-                        result = result_
-                        avg_logprob = avg_logprob_
-                        temperature = temperature_
-                        compression_ratio = compression_rate_
-                        text = text_
-                    
-                    recovery_attempts += 1
-
-                elif recovery_attempts == 1:
-                    #decrease beam size and remove context
-                    print("Second recovery attempt")
-                    modified_options.condition_on_previous_text = False
-                    modified_options.beam_size = max(options.beam_size - 2,min_beam_size)
-
-                    #generate result, decode and calculate metrics
-                    (result_,avg_logprob_,temperature_,compression_rate_) = self.generate_with_fallback(encoder_output, prompt, tokenizer, modified_options)
-                    text_ = tokenizer.decode(result_.sequences_ids[0])
-                    all_scores_=calculate_all_metrics(text_)
-                    ngram_score_=all_scores_['ngram_score']
-                    compression_rate_=all_scores_['compression_rate']
-
-                    is_hallucination = self.detect_hallucination(ngram_score_,compression_rate_,
-                        ngram_threshold=ngram_threshold,
-                        compression_threshold=compression_threshold
+                    elif recovery_attempts == 1:
+                        # Second recovery attempt: decrease beam size
+                        result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_decrease_beam_size(
+                            encoder_output, prompt, tokenizer, modified_options
                         )
-                    
-                    if not is_hallucination:
-                        print("Hallucination fixed with decrease beam size!")
-                        # Update result and metrics
-                        result = result_
-                        avg_logprob = avg_logprob_
-                        temperature = temperature_
-                        compression_ratio = compression_rate_
-                        text = text_
-                    
-                    recovery_attempts += 1
+                    elif recovery_attempts == 2:
+                        # Third recovery attempt: VAD cleaning
+                        result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_vad_cleaning(
+                            encoder_output, prompt, tokenizer, modified_options, current_audio_chunk
+                        )
+                    elif recovery_attempts == 3:
+                        # Fourth recovery attempt: audio enhancement
+                        try:
+                            result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_audio_enhancement(
+                                encoder_output, prompt, tokenizer, modified_options, current_audio_chunk
+                            )
+                        except Exception as e:
+                            print(f"Audio enhancement failed: {e}")
+                            recovery_attempts += 1
+                            modified_options = options  # Reset options
+                            continue
+                    else:
+                        print("Recovery attempts exhausted")
+                        modified_options = options  # Reset options to original
+                        break
 
-                elif recovery_attempts == 2:
-                    print("Third recovery attempt - VAD-based Audio Cleaning")
-                    
-                    # Apply VAD to clean the audio chunk
-                    vad_parameters = VadOptions(max_speech_duration_s=3000, min_silence_duration_ms=160)
-                    speech_chunks = get_speech_timestamps(current_audio_chunk, vad_parameters)
-                    audio_chunks, chunks_metadata = collect_chunks(current_audio_chunk, speech_chunks)
-                    cleaned_audio = np.concatenate(audio_chunks, axis=0)
-                    
-                    # Calculate new duration and adjust parameters
-                    cleaned_duration = cleaned_audio.shape[0] / self.sampling_rate
-                    print(f"VAD reduced audio from {current_audio_chunk.shape[0]/self.sampling_rate:.2f}s to {cleaned_duration:.2f}s")
-                    
-                    # Convert cleaned audio to features
-                    cleaned_features = self.convert_audio_to_features(cleaned_audio)
-                    
-                    # Adjust segment size for the cleaned features
-                    cleaned_segment_size = min(
-                        cleaned_features.shape[-1],  # Use actual feature length
-                        self.feature_extractor.nb_max_frames
-                    )
-                    
-                    # Pad or trim cleaned features to expected size - so that seek is not affected
-                    cleaned_segment = pad_or_trim(cleaned_features)
-                    
-                    # Encode the cleaned features
-                    cleaned_encoder_output = self.encode(cleaned_segment)
-                    
-                    # Generate result with cleaned audio, decode and calculate metrics
-                    (result_, avg_logprob_, temperature_, compression_rate_) = self.generate_with_fallback(
-                        cleaned_encoder_output, prompt, tokenizer, modified_options
-                    )
+                    # Check if hallucination is fixed with the current strategy
                     text_ = tokenizer.decode(result_.sequences_ids[0])
                     all_scores_ = calculate_all_metrics(text_)
                     ngram_score_ = all_scores_['ngram_score']
                     compression_rate_ = all_scores_['compression_rate']
-                    
-                    # Check if hallucination is fixed
+
                     is_hallucination = self.detect_hallucination(
-                        ngram_score_, compression_rate_, 
+                        ngram_score_, compression_rate_,
                         ngram_threshold=ngram_threshold,
                         compression_threshold=compression_threshold
                     )
                     
                     if not is_hallucination:
-                        print("Hallucination fixed with VAD cleaning!")
+                        strategy_names = ["increase beam size", "decrease beam size", "VAD cleaning", "audio enhancement"]
+                        print(f"Hallucination fixed with {strategy_names[recovery_attempts]}!")
                         # Update result and metrics
                         result = result_
                         avg_logprob = avg_logprob_
                         temperature = temperature_
-                        compression_ratio = compression_rate_
+                        compression_ratio = compression_ratio_
                         text = text_
+                        break
                     
                     recovery_attempts += 1
-
-                elif recovery_attempts == 3:
-                    print("Fourth recovery attempt - Audio Enhancement with Convtasnet")
-                    
-                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                        temp_audio_path = temp_file.name
-                        sf.write(temp_audio_path, current_audio_chunk, self.sampling_rate)
-                    
-                    try:
-                        # Enhance the audio using Convtasnet
-                        enhancer = Enhancer(temp_audio_path, 'convtasnet')
-                        enhanced_audio_tensor = enhancer.get_enhanced_audio()
-                        
-                        # Convert tensor to numpy array
-                        enhanced_audio_chunk = enhanced_audio_tensor.squeeze().detach().cpu().numpy()
-                        sf.write('enhanced_audio_chunk.wav', enhanced_audio_chunk, self.sampling_rate) #TEST
-                        
-                        # Clean up enhancement model memory
-                        del enhanced_audio_tensor
-                        del enhancer
-                        
-                        # Force garbage collection and clear GPU cache - stop memory leak caused by reusing enhancing model
-                        import gc
-                        gc.collect()
-                        try:
-                            import torch
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                        except ImportError:
-                            pass
-                        
-                        # Convert enhanced audio back to features and encode
-                        enhanced_features = self.convert_audio_to_features(enhanced_audio_chunk)
-                        enhanced_encoder_output = self.encode(enhanced_features)
-                        
-                        # Generate result with enhanced audio, decode and calculate metrics
-                        (result_, avg_logprob_, temperature_, compression_rate_) = self.generate_with_fallback(
-                            enhanced_encoder_output, prompt, tokenizer, modified_options
-                        )
-                        text_ = tokenizer.decode(result_.sequences_ids[0])
-                        all_scores_ = calculate_all_metrics(text_)
-                        ngram_score_ = all_scores_['ngram_score']
-                        compression_rate_ = all_scores_['compression_rate']
-                        
-                        # Check if hallucination is fixed
-                        is_hallucination = self.detect_hallucination(
-                            ngram_score_, compression_rate_, 
-                           ngram_threshold=ngram_threshold,compression_threshold=compression_threshold
-                        )
-                        
-                        if not is_hallucination:
-                            print("Hallucination fixed with audio enhancement!")
-                            # Update result and metrics
-                            result = result_
-                            avg_logprob = avg_logprob_
-                            temperature = temperature_
-                            compression_ratio = compression_rate_
-                            text = text_
-                        
-                        recovery_attempts += 1
-                        
-                    except Exception as e:
-                        print(f"Audio enhancement failed: {e}")
-                        recovery_attempts += 1
-                    finally:
-                        # Clean up temporary file
-                        import os
-                        if os.path.exists(temp_audio_path):
-                            os.unlink(temp_audio_path)
-
-                else:
-                    print("recovery attempts exhausted")
-                    modified_options=options # reset options to original before stopping loop
-                    break
-                
-                #reset options between attempts
-                modified_options=options
-       
+                    modified_options = options  # Reset options between attempts
 
             if options.no_speech_threshold is not None:
                 # no voice activity check
@@ -2236,6 +2113,120 @@ class WhisperModel:
         duration_seconds = (audio_end_sample - audio_start_sample) / self.sampling_rate
         
         return duration_seconds
+
+    def _apply_recovery_strategy(self, strategy_name: str, encoder_output, prompt, tokenizer, 
+                               modified_options, current_audio_chunk, seek, segment_size):
+        """
+        Apply a specific hallucination recovery strategy.
+        
+        Returns:
+            tuple: (result, avg_logprob, temperature, compression_ratio, success)
+        """
+        if strategy_name == "increase_beam_size":
+            return self._recovery_increase_beam_size(encoder_output, prompt, tokenizer, modified_options)
+        elif strategy_name == "decrease_beam_size":
+            return self._recovery_decrease_beam_size(encoder_output, prompt, tokenizer, modified_options)
+        elif strategy_name == "vad_cleaning":
+            return self._recovery_vad_cleaning(encoder_output, prompt, tokenizer, modified_options, current_audio_chunk)
+        elif strategy_name == "audio_enhancement":
+            return self._recovery_audio_enhancement(encoder_output, prompt, tokenizer, modified_options, current_audio_chunk)
+        else:
+            raise ValueError(f"Unknown recovery strategy: {strategy_name}")
+
+    def _recovery_increase_beam_size(self, encoder_output, prompt, tokenizer, modified_options):
+        """First recovery attempt: increase beam size and remove context."""
+        print("First recovery attempt - increase beam size")
+        modified_options.condition_on_previous_text = False
+        modified_options.beam_size = min(modified_options.beam_size + 2, modified_options.max_beam_size)
+        
+        result, avg_logprob, temperature, compression_ratio = self.generate_with_fallback(
+            encoder_output, prompt, tokenizer, modified_options
+        )
+        return result, avg_logprob, temperature, compression_ratio
+
+    def _recovery_decrease_beam_size(self, encoder_output, prompt, tokenizer, modified_options):
+        """Second recovery attempt: decrease beam size and remove context."""
+        print("Second recovery attempt - decrease beam size")
+        modified_options.condition_on_previous_text = False
+        modified_options.beam_size = max(modified_options.beam_size - 2, modified_options.min_beam_size)
+        
+        result, avg_logprob, temperature, compression_ratio = self.generate_with_fallback(
+            encoder_output, prompt, tokenizer, modified_options
+        )
+        return result, avg_logprob, temperature, compression_ratio
+
+    def _recovery_vad_cleaning(self, encoder_output, prompt, tokenizer, modified_options, current_audio_chunk):
+        """Third recovery attempt: VAD-based audio cleaning."""
+        print("Third recovery attempt - VAD-based Audio Cleaning")
+        
+        # Apply VAD to clean the audio chunk
+        vad_parameters = VadOptions(max_speech_duration_s=3000, min_silence_duration_ms=160)
+        speech_chunks = get_speech_timestamps(current_audio_chunk, vad_parameters)
+        audio_chunks, chunks_metadata = collect_chunks(current_audio_chunk, speech_chunks)
+        cleaned_audio = np.concatenate(audio_chunks, axis=0)
+        
+        # Calculate new duration and adjust parameters
+        cleaned_duration = cleaned_audio.shape[0] / self.sampling_rate
+        print(f"VAD reduced audio from {current_audio_chunk.shape[0]/self.sampling_rate:.2f}s to {cleaned_duration:.2f}s")
+        
+        # Convert cleaned audio to features and encode
+        cleaned_features = self.convert_audio_to_features(cleaned_audio)
+        cleaned_encoder_output = self.encode(cleaned_features)
+        
+        # Generate result with cleaned audio
+        result, avg_logprob, temperature, compression_ratio = self.generate_with_fallback(
+            cleaned_encoder_output, prompt, tokenizer, modified_options
+        )
+        return result, avg_logprob, temperature, compression_ratio
+
+    def _recovery_audio_enhancement(self, encoder_output, prompt, tokenizer, modified_options, current_audio_chunk):
+        """Fourth recovery attempt: Audio enhancement with Convtasnet."""
+        print("Fourth recovery attempt - Audio Enhancement with Convtasnet")
+        
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            temp_audio_path = temp_file.name
+            sf.write(temp_audio_path, current_audio_chunk, self.sampling_rate)
+        
+        try:
+            # Enhance the audio using Convtasnet
+            enhancer = Enhancer(temp_audio_path, 'convtasnet')
+            enhanced_audio_tensor = enhancer.get_enhanced_audio()
+            
+            # Convert tensor to numpy array
+            enhanced_audio_chunk = enhanced_audio_tensor.squeeze().detach().cpu().numpy()
+            
+            # Clean up enhancement model memory
+            del enhanced_audio_tensor
+            del enhancer
+            
+            # Force garbage collection and clear GPU cache
+            import gc
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+            
+            # Convert enhanced audio back to features and encode
+            enhanced_features = self.convert_audio_to_features(enhanced_audio_chunk)
+            enhanced_encoder_output = self.encode(enhanced_features)
+            
+            # Generate result with enhanced audio
+            result, avg_logprob, temperature, compression_ratio = self.generate_with_fallback(
+                enhanced_encoder_output, prompt, tokenizer, modified_options
+            )
+            return result, avg_logprob, temperature, compression_ratio
+            
+        except Exception as e:
+            print(f"Audio enhancement failed: {e}")
+            raise
+        finally:
+            # Clean up temporary file
+            import os
+            if os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
 
 
 def restore_speech_timestamps(
