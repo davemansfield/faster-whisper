@@ -94,9 +94,9 @@ def get_speech_timestamps(
     if neg_threshold is None:
         neg_threshold = max(threshold - 0.15, 0.01)
 
-    # to save potential segment end (and tolerate some silence)
+    #to save potential segment end (and tolerate some silence)
     temp_end = 0
-    # to save potential segment limits in case of maximum segment size reached
+    #to save potential segment limits in case of maximum segment size reached
     prev_end = next_start = 0
 
     for i, speech_prob in enumerate(speech_probs):
@@ -118,7 +118,7 @@ def get_speech_timestamps(
                 current_speech["end"] = prev_end
                 speeches.append(current_speech)
                 current_speech = {}
-                # previously reached silence (< neg_thres) and is still not speech (< thres)
+                #previously reached silence (< neg_thres) and is still not speech (< thres)
                 if next_start < prev_end:
                     triggered = False
                 else:

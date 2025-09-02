@@ -7,7 +7,7 @@ import zlib
 from dataclasses import asdict, dataclass
 from inspect import signature
 from math import ceil
-from typing import BinaryIO, Iterable, List, Optional, Tuple, Union
+from typing import Any, BinaryIO, Iterable, List, Optional, Tuple, Union
 from warnings import warn
 
 import ctranslate2
@@ -31,6 +31,13 @@ from faster_whisper.vad import (
 
 from preprocess_pipeline.utils import calculate_all_metrics
 from preprocess_pipeline.enhancement import Enhancer
+from preprocess_pipeline.separation import Separator
+from preprocess_pipeline.diarization import Diarizer
+import torch
+import gc
+import os
+
+
 import tempfile
 from pathlib import Path
 
@@ -102,15 +109,14 @@ class TranscriptionOptions:
     hallucination_silence_threshold: Optional[float]
     hotwords: Optional[str]
     # Hallucination recovery parameters
-    enable_hallucination_recovery: bool = True
+    enable_hallucination_recovery: bool = False
     max_beam_size: int = 7
     min_beam_size: int = 3
     ngram_threshold: float = 20.0
     compression_threshold: float = 2.0
-    max_recovery_attempts: int = 4
-    red_light: bool = True
-    yellow_light: bool = True
-    green_light: bool = True
+    red_light: bool = False
+    yellow_light: bool = False
+    green_light: bool = False
 
 
 @dataclass
@@ -313,15 +319,14 @@ class BatchedInferencePipeline:
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
         # Hallucination recovery parameters
-        enable_hallucination_recovery: bool = True,
+        enable_hallucination_recovery: bool = False,
         max_beam_size: int = 7,
         min_beam_size: int = 3,
         ngram_threshold: float = 20.0,
         compression_threshold: float = 2.0,
-        max_recovery_attempts: int = 4,
-        red_light: bool = True,
-        yellow_light: bool = True,
-        green_light: bool = True,
+        red_light: bool = False,
+        yellow_light: bool = False,
+        green_light: bool = False,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """transcribe audio in chunks in batched fashion and return with language info.
 
@@ -551,7 +556,6 @@ class BatchedInferencePipeline:
             min_beam_size=min_beam_size,
             ngram_threshold=ngram_threshold,
             compression_threshold=compression_threshold,
-            max_recovery_attempts=max_recovery_attempts,
             red_light=red_light,
             yellow_light=yellow_light,
             green_light=green_light,
@@ -671,14 +675,14 @@ class WhisperModel:
         """
         self.logger = get_logger()
 
-        # Initialize enhancement model once
-        try:
-            # Create a dummy enhancer to initialize the model
-            self.enhancer = None  # Will be initialized on first use
-            self.enhancement_available = True
-        except ImportError:
-            self.enhancement_available = False
-            print("Enhancement module not available")
+        # # Initialize enhancement model once
+        # try:
+        #     # Create a dummy enhancer to initialize the model
+        #     self.enhancer = None  # Will be initialized on first use
+        #     self.enhancement_available = True
+        # except ImportError:
+        #     self.enhancement_available = False
+        #     print("Enhancement module not available")
 
         tokenizer_bytes, preprocessor_bytes = None, None
         if files:
@@ -799,15 +803,14 @@ class WhisperModel:
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
         # Hallucination recovery parameters
-        enable_hallucination_recovery: bool = True,
+        enable_hallucination_recovery: bool = False,
         max_beam_size: int = 7,
         min_beam_size: int = 3,
         ngram_threshold: float = 20.0,
         compression_threshold: float = 2.0,
-        max_recovery_attempts: int = 4,
-        red_light: bool = True,
-        yellow_light: bool = True,
-        green_light: bool = True,
+        red_light: bool = False,
+        yellow_light: bool = False,
+        green_light: bool = False,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -885,13 +888,6 @@ class WhisperModel:
         """
         sampling_rate = self.feature_extractor.sampling_rate
 
-        # Store the original audio filename for chunk naming
-        # Only set if not already set (e.g., from external call)
-        if not hasattr(self, 'original_audio_filename') or self.original_audio_filename is None:
-            if isinstance(audio, str):
-                self.original_audio_filename = Path(audio).stem  # Get filename without extension
-            else:
-                self.original_audio_filename = "unknown_audio"
 
         if multilingual and not self.model.is_multilingual:
             self.logger.warning(
@@ -1037,7 +1033,6 @@ class WhisperModel:
             min_beam_size=min_beam_size,
             ngram_threshold=ngram_threshold,
             compression_threshold=compression_threshold,
-            max_recovery_attempts=max_recovery_attempts,
             red_light=red_light,
             yellow_light=yellow_light,
             green_light=green_light,
@@ -1141,6 +1136,133 @@ class WhisperModel:
 
         return current_segments, seek, single_timestamp_ending
 
+    def _attempt_hallucination_recovery(
+        self,
+        encoder_output: ctranslate2.StorageView,
+        prompt: List[int],
+        tokenizer: Tokenizer,
+        options: TranscriptionOptions,
+        modified_options: TranscriptionOptions,
+        current_audio_chunk: np.ndarray,
+        seek: int,
+        segment_size: int,
+        result: Any,
+        avg_logprob: float,
+        temperature: float,
+        compression_ratio: float,
+        text: str,
+    ) -> tuple[Any, float, float, float, str, bool]:
+        """
+        Attempt to recover from hallucination using available strategies.
+        
+        Returns:
+            tuple: (result, avg_logprob, temperature, compression_ratio, text, success)
+        """
+        # Define available recovery strategies based on light settings
+        available_strategies = []
+        
+        if options.green_light:
+            available_strategies.extend([
+                ("increase_beam_size", 0),
+                ("decrease_beam_size", 1), 
+                ("drop_beam_size", 2),
+                ("vad_cleaning", 3)
+            ])
+        
+        if options.yellow_light:
+            available_strategies.append(("audio_enhancement", 4))
+        
+        if options.red_light:
+            available_strategies.append(("speaker_separation", 5))
+        
+        if not available_strategies:
+            print("No recovery strategies enabled - skipping hallucination recovery")
+            return result, avg_logprob, temperature, compression_ratio, text, False
+        
+        print(f"Available recovery strategies: {[s[0] for s in available_strategies]}")
+        
+        # Loop until hallucination is fixed or all available strategies are exhausted
+        strategy_index = 0
+        while strategy_index < len(available_strategies):
+            duration = self.get_segment_duration(seek, segment_size)
+            # Check if segment is too short (less than 1 second) and skip if so
+            if duration < 1.0:
+                print(f"Skipping chunk at seek {seek} - duration too short: {duration:.2f}s likely to cause hallucination")
+                return result, avg_logprob, temperature, compression_ratio, text, False
+
+            strategy_name, attempt_num = available_strategies[strategy_index]
+            print(f"Attempting recovery strategy {strategy_index + 1}/{len(available_strategies)}: {strategy_name}")
+            
+            # Apply recovery strategy
+            try:
+                if strategy_name == "increase_beam_size":
+                    result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_increase_beam_size(
+                        encoder_output, prompt, tokenizer, modified_options
+                    )
+                elif strategy_name == "decrease_beam_size":
+                    result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_decrease_beam_size(
+                        encoder_output, prompt, tokenizer, modified_options
+                    )
+                elif strategy_name == "drop_beam_size":
+                    result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_drop_beam_size(
+                        encoder_output, prompt, tokenizer, modified_options
+                    )
+                elif strategy_name == "vad_cleaning":
+                    result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_vad_cleaning(
+                        encoder_output, prompt, tokenizer, modified_options, current_audio_chunk
+                    )
+                elif strategy_name == "audio_enhancement":
+                    result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_audio_enhancement(
+                        encoder_output, prompt, tokenizer, modified_options, current_audio_chunk
+                    )
+                elif strategy_name == "speaker_separation":
+                    # Check if separation is actually needed and get diarization result
+                    needs_separation, diarization_result = self._check_for_speaker_overlap(current_audio_chunk)
+                    if not needs_separation:
+                        print("Speaker separation not needed, skipping this recovery attempt")
+                        strategy_index += 1
+                        modified_options = options  # Reset options
+                        continue
+                    
+                    result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_speaker_separation(
+                        encoder_output, prompt, tokenizer, modified_options, current_audio_chunk, diarization_result
+                    )
+                else:
+                    print(f"Unknown strategy: {strategy_name}")
+                    strategy_index += 1
+                    continue
+                    
+            except Exception as e:
+                print(f"Recovery strategy '{strategy_name}' failed: {e}")
+                strategy_index += 1
+                modified_options = options  # Reset options
+                continue
+
+            # Check if hallucination is fixed with the current strategy
+            text_ = tokenizer.decode(result_.sequences_ids[0])
+            all_scores_ = calculate_all_metrics(text_)
+            ngram_score_ = all_scores_['ngram_score']
+            compression_rate_ = all_scores_['compression_rate']
+
+            is_hallucination = self.detect_hallucination(
+                ngram_score_, compression_rate_,
+                ngram_threshold=options.ngram_threshold,
+                compression_threshold=options.compression_threshold
+            )
+            
+            if not is_hallucination:
+                print(f"Hallucination fixed with {strategy_name}!")
+                # Update result and metrics
+                return result_, avg_logprob_, temperature_, compression_ratio_, text_, True
+            
+            # Move to next strategy
+            strategy_index += 1
+            modified_options = options  # Reset options between attempts
+        
+        # If we've tried all strategies and still have hallucination
+        print("All available recovery strategies exhausted")
+        return result, avg_logprob, temperature, compression_ratio, text, False
+
     def generate_segments(
         self,
         features: np.ndarray,
@@ -1184,10 +1306,9 @@ class WhisperModel:
             min_beam_size=options.min_beam_size,
             ngram_threshold=options.ngram_threshold,
             compression_threshold=options.compression_threshold,
-            max_recovery_attempts=options.max_recovery_attempts,
-            red_light=True,
-            yellow_light=True,
-            green_light=True,
+            red_light=options.red_light,
+            yellow_light=options.yellow_light,
+            green_light=options.green_light,
         )
         
         if isinstance(options.clip_timestamps, str):
@@ -1300,102 +1421,39 @@ class WhisperModel:
                 prefix=options.prefix if seek == 0 else None,
                 hotwords=options.hotwords,
             )
+            
 
             #first generation attempt
             (result,avg_logprob,temperature,compression_ratio) = self.generate_with_fallback(encoder_output, prompt, tokenizer, options)
             text = tokenizer.decode(result.sequences_ids[0])
 
-            #check for halluciantion
-            all_Scores=calculate_all_metrics(text)
-            ngram_score=all_Scores['ngram_score']
-            compression_rate=all_Scores['compression_rate']
+            if options.enable_hallucination_recovery:
+                #check for halluciantion
+                all_Scores=calculate_all_metrics(text)
+                ngram_score=all_Scores['ngram_score']
+                compression_rate=all_Scores['compression_rate']
 
-            recovery_attempts = 0
-            
-            # Use configurable parameters from options
-            max_beam_size = options.max_beam_size
-            min_beam_size = options.min_beam_size
-            hallucination_recovery = options.enable_hallucination_recovery
-            ngram_threshold = options.ngram_threshold
-            compression_threshold = options.compression_threshold
-            max_recovery_attempts = options.max_recovery_attempts
-            red_light = options.red_light
-            yellow_light = options.yellow_light
-            green_light = options.green_light
-            
-            is_hallucination = self.detect_hallucination(ngram_score,compression_rate,
-                ngram_threshold=ngram_threshold,
-                compression_threshold=compression_threshold
-                )
-            
-            if is_hallucination:
-                #loop until hallucination is fixed or recovery attempts are exhausted
-                while is_hallucination and hallucination_recovery and recovery_attempts < max_recovery_attempts:
-                    duration = self.get_segment_duration(seek, segment_size)
-                    # Check if segment is too short (less than 1 second) and skip if so
-                    if duration < 1.0:
-                        print(f"Skipping chunk at seek {seek} - duration too short: {duration:.2f}s likley to cause hallucination")
-                        seek += segment_size
-                        break
+                recovery_attempts = 0
 
-                    # Apply recovery strategy based on attempt number
-                    if recovery_attempts == 0:
-                        # First recovery attempt: increase beam size
-                        result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_increase_beam_size(
-                            encoder_output, prompt, tokenizer, modified_options
-                        )
-                    elif recovery_attempts == 1:
-                        # Second recovery attempt: decrease beam size
-                        result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_decrease_beam_size(
-                            encoder_output, prompt, tokenizer, modified_options
-                        )
-                    elif recovery_attempts == 2:
-                        # Third recovery attempt: VAD cleaning
-                        result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_vad_cleaning(
-                            encoder_output, prompt, tokenizer, modified_options, current_audio_chunk
-                        )
-                    elif recovery_attempts == 3:
-                        # Fourth recovery attempt: audio enhancement
-                        try:
-                            result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_audio_enhancement(
-                                encoder_output, prompt, tokenizer, modified_options, current_audio_chunk
-                            )
-                        except Exception as e:
-                            print(f"Audio enhancement failed: {e}")
-                            recovery_attempts += 1
-                            modified_options = options  # Reset options
-                            continue
-                    else:
-                        print("Recovery attempts exhausted")
-                        modified_options = options  # Reset options to original
-                        break
-
-                    # Check if hallucination is fixed with the current strategy
-                    text_ = tokenizer.decode(result_.sequences_ids[0])
-                    all_scores_ = calculate_all_metrics(text_)
-                    ngram_score_ = all_scores_['ngram_score']
-                    compression_rate_ = all_scores_['compression_rate']
-
-                    is_hallucination = self.detect_hallucination(
-                        ngram_score_, compression_rate_,
-                        ngram_threshold=ngram_threshold,
-                        compression_threshold=compression_threshold
+                
+                is_hallucination = self.detect_hallucination(ngram_score,compression_rate,
+                    ngram_threshold=options.ngram_threshold,
+                    compression_threshold=options.compression_threshold
+                    )
+                
+                if is_hallucination:
+                    # Attempt hallucination recovery
+                    (result, avg_logprob, temperature, compression_ratio, text, recovery_success) = self._attempt_hallucination_recovery(
+                        encoder_output, prompt, tokenizer, options, modified_options, 
+                        current_audio_chunk, seek, segment_size, 
+                        result, avg_logprob, temperature, compression_ratio, text
                     )
                     
-                    if not is_hallucination:
-                        strategy_names = ["increase beam size", "decrease beam size", "VAD cleaning", "audio enhancement"]
-                        print(f"Hallucination fixed with {strategy_names[recovery_attempts]}!")
-                        # Update result and metrics
-                        result = result_
-                        avg_logprob = avg_logprob_
-                        temperature = temperature_
-                        compression_ratio = compression_ratio_
-                        text = text_
-                        break
-                    
-                    recovery_attempts += 1
-                    modified_options = options  # Reset options between attempts
-
+                    if recovery_success:
+                        print("Hallucination recovery completed successfully")
+                    else:
+                        print("Hallucination recovery failed - using original result")
+            
             if options.no_speech_threshold is not None:
                 # no voice activity check
                 should_skip = result.no_speech_prob > options.no_speech_threshold
@@ -1736,7 +1794,7 @@ class WhisperModel:
             bool: True if hallucination detected, False otherwise
         """
         
-        # Hallucination is detected if BOTH thresholds are exceeded
+        # Hallucination is detected if EITHER threshold is exceeded
         # High n-gram score indicates repetitive/unusual text patterns
         # High compression rate indicates highly repetitive content
         is_hallucination = ngram_score > ngram_threshold or compression_rate > compression_threshold
@@ -2114,24 +2172,6 @@ class WhisperModel:
         
         return duration_seconds
 
-    def _apply_recovery_strategy(self, strategy_name: str, encoder_output, prompt, tokenizer, 
-                               modified_options, current_audio_chunk, seek, segment_size):
-        """
-        Apply a specific hallucination recovery strategy.
-        
-        Returns:
-            tuple: (result, avg_logprob, temperature, compression_ratio, success)
-        """
-        if strategy_name == "increase_beam_size":
-            return self._recovery_increase_beam_size(encoder_output, prompt, tokenizer, modified_options)
-        elif strategy_name == "decrease_beam_size":
-            return self._recovery_decrease_beam_size(encoder_output, prompt, tokenizer, modified_options)
-        elif strategy_name == "vad_cleaning":
-            return self._recovery_vad_cleaning(encoder_output, prompt, tokenizer, modified_options, current_audio_chunk)
-        elif strategy_name == "audio_enhancement":
-            return self._recovery_audio_enhancement(encoder_output, prompt, tokenizer, modified_options, current_audio_chunk)
-        else:
-            raise ValueError(f"Unknown recovery strategy: {strategy_name}")
 
     def _recovery_increase_beam_size(self, encoder_output, prompt, tokenizer, modified_options):
         """First recovery attempt: increase beam size and remove context."""
@@ -2154,10 +2194,21 @@ class WhisperModel:
             encoder_output, prompt, tokenizer, modified_options
         )
         return result, avg_logprob, temperature, compression_ratio
+    
+    def _recovery_drop_beam_size(self, encoder_output, prompt, tokenizer, modified_options):
+        """Third recovery attempt: decrease beam size to 1 (minimum value)."""
+        print("Third recovery attempt - drop beam size to 1")
+        modified_options.condition_on_previous_text = False
+        modified_options.beam_size = 1
+        
+        result, avg_logprob, temperature, compression_ratio = self.generate_with_fallback(
+            encoder_output, prompt, tokenizer, modified_options
+        )
+        return result, avg_logprob, temperature, compression_ratio
 
     def _recovery_vad_cleaning(self, encoder_output, prompt, tokenizer, modified_options, current_audio_chunk):
-        """Third recovery attempt: VAD-based audio cleaning."""
-        print("Third recovery attempt - VAD-based Audio Cleaning")
+        """Forth recovery attempt: VAD-based audio cleaning."""
+        print("Fourth recovery attempt - VAD-based Audio Cleaning")
         
         # Apply VAD to clean the audio chunk
         vad_parameters = VadOptions(max_speech_duration_s=3000, min_silence_duration_ms=160)
@@ -2180,8 +2231,8 @@ class WhisperModel:
         return result, avg_logprob, temperature, compression_ratio
 
     def _recovery_audio_enhancement(self, encoder_output, prompt, tokenizer, modified_options, current_audio_chunk):
-        """Fourth recovery attempt: Audio enhancement with Convtasnet."""
-        print("Fourth recovery attempt - Audio Enhancement with Convtasnet")
+        """Fifth recovery attempt: Audio enhancement with Convtasnet."""
+        print("Fifth recovery attempt - Audio Enhancement with Convtasnet")
         
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
             temp_audio_path = temp_file.name
@@ -2200,14 +2251,10 @@ class WhisperModel:
             del enhancer
             
             # Force garbage collection and clear GPU cache
-            import gc
             gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except ImportError:
-                pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             
             # Convert enhanced audio back to features and encode
             enhanced_features = self.convert_audio_to_features(enhanced_audio_chunk)
@@ -2224,7 +2271,224 @@ class WhisperModel:
             raise
         finally:
             # Clean up temporary file
-            import os
+            if os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
+
+    def _recovery_speaker_separation(self, encoder_output, prompt, tokenizer, modified_options, current_audio_chunk, diarization_result=None):
+        """Sixth recovery attempt: Speaker separation and separate transcription."""
+        print("Sixth recovery attempt - Speaker Separation")
+        
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            temp_audio_path = temp_file.name
+            sf.write(temp_audio_path, current_audio_chunk, self.sampling_rate)
+        
+        try:
+            # Use provided diarization result if available, otherwise run diarization
+            diarizer = None
+            if diarization_result is None:
+                print("No diarization result provided, running diarization...")
+                diarizer = Diarizer(temp_audio_path)
+                diarization_result = diarizer.diarization
+            
+            # Separate speakers using the separation model
+            separator = Separator(temp_audio_path, 'convtasnet_libri2mix_noisy')
+            
+            # Get the separated sources using the existing method
+            separated_audio_tensors = separator.get_sources()
+            
+            # Convert tensors to numpy arrays
+            separated_audio_chunks = []
+            for audio_tensor in separated_audio_tensors:
+                if audio_tensor.dim() == 2:
+                    audio_chunk = audio_tensor[0].detach().cpu().numpy()
+                else:
+                    audio_chunk = audio_tensor.detach().cpu().numpy()
+                separated_audio_chunks.append(audio_chunk)
+            
+            # Clean up separation model memory
+            del separated_audio_tensors
+            del separator
+            
+            # Force garbage collection and clear GPU cache
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            
+            # Transcribe each separated track separately
+            all_transcriptions = []
+            for i, audio_chunk in enumerate(separated_audio_chunks):
+                print(f"Transcribing speaker {i+1} track...")
+                
+                features = self.convert_audio_to_features(audio_chunk)
+                encoder_output_sep = self.encode(features)
+                
+                result, avg_logprob, temperature, compression_ratio = self.generate_with_fallback(
+                    encoder_output_sep, prompt, tokenizer, modified_options
+                )
+                
+                text = tokenizer.decode(result.sequences_ids[0])
+                
+                all_transcriptions.append({
+                    'text': text,
+                    'result': result,
+                    'avg_logprob': avg_logprob,
+                    'temperature': temperature,
+                    'compression_ratio': compression_ratio,
+                    'speaker_id': i
+                })
+            
+            # Merge transcriptions with diarization timing
+            merged_result = self._merge_separated_transcriptions(all_transcriptions, diarization_result)
+            
+            return merged_result
+            
+        except Exception as e:
+            print(f"Speaker separation failed: {e}")
+            raise
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
+            
+            # Clean up diarization model memory only if we created one
+            if diarizer is not None:
+                try:
+                    del diarizer
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except:
+                    pass
+
+    def _merge_separated_transcriptions(self, transcriptions, diarization_result=None):
+        """
+        Merge transcriptions from separated speaker tracks based on timestamps and diarization.
+        
+        Args:
+            transcriptions: List of transcription dictionaries
+            diarization_result: Optional diarization result for timing information
+            
+        Returns:
+            tuple: (result, avg_logprob, temperature, compression_ratio)
+        """
+        if not transcriptions:
+            raise ValueError("No transcriptions to merge")
+        
+        if len(transcriptions) == 1:
+            # Only one speaker, return as-is
+            trans = transcriptions[0]
+            return trans['result'], trans['avg_logprob'], trans['temperature'], trans['compression_ratio']
+        
+
+        return self._merge_transcriptions(transcriptions)
+
+
+
+    def _merge_transcriptions(self, transcriptions):
+        """
+        Simple fallback merging strategy.
+        """
+        merged_text = ""
+        best_result = None
+        best_avg_logprob = float('-inf')
+        
+        for trans in transcriptions:
+            speaker_label = f"[Speaker {trans['speaker_id']+1}] "
+            merged_text += speaker_label + trans['text'] + " "
+            
+            if trans['avg_logprob'] > best_avg_logprob:
+                best_avg_logprob = trans['avg_logprob']
+                best_result = trans['result']
+        
+        print(f"Simple merged transcription: {merged_text[:100]}...")
+        
+        return best_result, best_avg_logprob, transcriptions[0]['temperature'], transcriptions[0]['compression_ratio']
+
+    def _check_for_speaker_overlap(self, audio_chunk: np.ndarray, overlap_threshold: float = 0.1) -> tuple[bool, Any]:
+        """
+        Check if speaker separation is needed using diarization.
+        
+        Args:
+            audio_chunk: Raw audio chunk as numpy array
+            overlap_threshold: Threshold for overlap percentage (default 0.25 = 25%)
+            
+        Returns:
+            tuple: (needs_separation, diarization_result) where needs_separation is bool
+        """
+        try:
+            # Save audio chunk to temporary file for diarization
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                temp_audio_path = temp_file.name
+                sf.write(temp_audio_path, audio_chunk, self.sampling_rate)
+            
+            try:
+                # Use diarization to detect speakers and their timings
+                diarizer = Diarizer(temp_audio_path)
+                diarization_result = diarizer.diarization
+                
+                # Get speaker count first
+                num_speakers = len(set(label for _, _, label in diarization_result.itertracks(yield_label=True)))
+                
+                if num_speakers <= 1:
+                    print(f"Only {num_speakers} speaker detected, skipping separation")
+                    return False, diarization_result
+                
+                # Extract speaker segments from diarization result
+                speaker_segments = []
+                for segment, track, label in diarization_result.itertracks(yield_label=True):
+                    speaker_segments.append({
+                        'speaker': label,
+                        'start': segment.start,
+                        'end': segment.end,
+                        'duration': segment.end - segment.start
+                    })
+                
+                # Calculate overlap percentage
+                total_duration = audio_chunk.shape[0] / self.sampling_rate
+                overlap_duration = 0.0
+                
+                # Check for overlapping speech segments
+                for i, seg1 in enumerate(speaker_segments):
+                    for seg2 in speaker_segments[i+1:]:
+                        # Calculate overlap between two segments
+                        overlap_start = max(seg1['start'], seg2['start'])
+                        overlap_end = min(seg1['end'], seg2['end'])
+                        
+                        if overlap_end > overlap_start:
+                            overlap_duration += overlap_end - overlap_start
+                
+                overlap_percentage = overlap_duration / total_duration
+                
+                print(f"Detected {num_speakers} speakers with {overlap_percentage:.2%} overlap")
+                
+                # Separation is needed if overlap exceeds threshold
+                needs_separation = overlap_percentage > overlap_threshold
+                
+                if needs_separation:
+                    print(f"Overlap {overlap_percentage:.2%} exceeds threshold {overlap_threshold:.2%}, separation needed")
+                else:
+                    print(f"Overlap {overlap_percentage:.2%} below threshold {overlap_threshold:.2%}, separation not needed")
+                
+                return needs_separation, diarization_result
+                
+            finally:
+                # Clean up diarization model memory
+                try:
+                    del diarizer
+                    gc.collect()
+
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except:
+                    pass
+                
+        except Exception as e:
+            print(f"Diarization check failed: {e}, defaulting to separation")
+            # If diarization fails, default to using separation to be safe
+            return True, None
+        finally:
+            # Clean up temporary file
             if os.path.exists(temp_audio_path):
                 os.unlink(temp_audio_path)
 
