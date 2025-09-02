@@ -29,6 +29,7 @@ from faster_whisper.vad import (
     merge_segments,
 )
 
+#impprt tools from preprocess_pipeline package
 from preprocess_pipeline.utils import calculate_all_metrics
 from preprocess_pipeline.enhancement import Enhancer
 from preprocess_pipeline.separation import Separator
@@ -36,10 +37,8 @@ from preprocess_pipeline.diarization import Diarizer
 import torch
 import gc
 import os
-
-
 import tempfile
-from pathlib import Path
+
 
 @dataclass
 class Word:
@@ -675,15 +674,6 @@ class WhisperModel:
         """
         self.logger = get_logger()
 
-        # # Initialize enhancement model once
-        # try:
-        #     # Create a dummy enhancer to initialize the model
-        #     self.enhancer = None  # Will be initialized on first use
-        #     self.enhancement_available = True
-        # except ImportError:
-        #     self.enhancement_available = False
-        #     print("Enhancement module not available")
-
         tokenizer_bytes, preprocessor_bytes = None, None
         if files:
             model_path = model_size_or_path
@@ -790,8 +780,8 @@ class WhisperModel:
         without_timestamps: bool = False,
         max_initial_timestamp: float = 1.0,
         word_timestamps: bool = False,
-        prepend_punctuations: str = "\"'¿([{-",
-        append_punctuations: str = "\"'.。,，!！?？:：",
+        prepend_punctuations: str = "\"'“¿([{-",
+        append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         multilingual: bool = False,
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
@@ -1138,27 +1128,27 @@ class WhisperModel:
 
     def _attempt_hallucination_recovery(
         self,
-        encoder_output: ctranslate2.StorageView,
-        prompt: List[int],
-        tokenizer: Tokenizer,
-        options: TranscriptionOptions,
-        modified_options: TranscriptionOptions,
-        current_audio_chunk: np.ndarray,
-        seek: int,
-        segment_size: int,
-        result: Any,
-        avg_logprob: float,
-        temperature: float,
-        compression_ratio: float,
-        text: str,
-    ) -> tuple[Any, float, float, float, str, bool]:
+        encoder_output,
+        prompt,
+        tokenizer,
+        options,
+        modified_options,
+        current_audio_chunk,
+        seek,
+        segment_size,
+        result,
+        avg_logprob,
+        temperature,
+        compression_ratio,
+        text):
+
+
         """
         Attempt to recover from hallucination using available strategies.
         
-        Returns:
-            tuple: (result, avg_logprob, temperature, compression_ratio, text, success)
+        Returns: (result, avg_logprob, temperature, compression_ratio, text, success)
         """
-        # Define available recovery strategies based on light settings
+        #define available recovery strategies based on light settings
         available_strategies = []
         
         if options.green_light:
@@ -1181,11 +1171,11 @@ class WhisperModel:
         
         print(f"Available recovery strategies: {[s[0] for s in available_strategies]}")
         
-        # Loop until hallucination is fixed or all available strategies are exhausted
+        #loop until hallucination is fixed or all available strategies are exhausted
         strategy_index = 0
         while strategy_index < len(available_strategies):
             duration = self.get_segment_duration(seek, segment_size)
-            # Check if segment is too short (less than 1 second) and skip if so
+            #check if segment is too short (less than 1 second)
             if duration < 1.0:
                 print(f"Skipping chunk at seek {seek} - duration too short: {duration:.2f}s likely to cause hallucination")
                 return result, avg_logprob, temperature, compression_ratio, text, False
@@ -1193,7 +1183,7 @@ class WhisperModel:
             strategy_name, attempt_num = available_strategies[strategy_index]
             print(f"Attempting recovery strategy {strategy_index + 1}/{len(available_strategies)}: {strategy_name}")
             
-            # Apply recovery strategy
+            #apply recovery strategy
             try:
                 if strategy_name == "increase_beam_size":
                     result_, avg_logprob_, temperature_, compression_ratio_ = self._recovery_increase_beam_size(
@@ -1216,7 +1206,7 @@ class WhisperModel:
                         encoder_output, prompt, tokenizer, modified_options, current_audio_chunk
                     )
                 elif strategy_name == "speaker_separation":
-                    # Check if separation is actually needed and get diarization result
+                    # check if separation is actually needed and get diarization result
                     needs_separation, diarization_result = self._check_for_speaker_overlap(current_audio_chunk)
                     if not needs_separation:
                         print("Speaker separation not needed, skipping this recovery attempt")
@@ -1238,7 +1228,7 @@ class WhisperModel:
                 modified_options = options  # Reset options
                 continue
 
-            # Check if hallucination is fixed with the current strategy
+            #check if hallucination is fixed with the current strategy
             text_ = tokenizer.decode(result_.sequences_ids[0])
             all_scores_ = calculate_all_metrics(text_)
             ngram_score_ = all_scores_['ngram_score']
@@ -1252,14 +1242,15 @@ class WhisperModel:
             
             if not is_hallucination:
                 print(f"Hallucination fixed with {strategy_name}!")
-                # Update result and metrics
+                #ppdate result and metrics
                 return result_, avg_logprob_, temperature_, compression_ratio_, text_, True
             
-            # Move to next strategy
+            #move to next strategy
             strategy_index += 1
             modified_options = options  # Reset options between attempts
         
-        # If we've tried all strategies and still have hallucination
+        #if tried all strategies and still have hallucination... 
+        #TODO add spectrogram comp
         print("All available recovery strategies exhausted")
         return result, avg_logprob, temperature, compression_ratio, text, False
 
@@ -1388,11 +1379,6 @@ class WhisperModel:
             #pad or trim the chunk to 3000 mel features as expected by the encoder
             segment = pad_or_trim(segment)
 
-            # Extract the corresponding raw audio chunk for this segment
-            current_audio_chunk = self.get_audio_chunk_for_segment(seek, segment_size)
-
-            # # Save the audio chunk as a WAV file for testing
-            # sf.write('audio_test.wav', current_audio_chunk, self.feature_extractor.sampling_rate)
 
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(
@@ -1442,7 +1428,10 @@ class WhisperModel:
                     )
                 
                 if is_hallucination:
-                    # Attempt hallucination recovery
+                    # attempt hallucination recovery
+
+                    current_audio_chunk = self.get_audio_chunk_for_segment(seek, segment_size)
+
                     (result, avg_logprob, temperature, compression_ratio, text, recovery_success) = self._attempt_hallucination_recovery(
                         encoder_output, prompt, tokenizer, options, modified_options, 
                         current_audio_chunk, seek, segment_size, 
@@ -1584,7 +1573,6 @@ class WhisperModel:
                 if last_word_end is not None:
                     last_speech_timestamp = last_word_end
 
-            #output formation in a generator object that is useful for user applications - good for collab
             for segment in current_segments:
                 tokens = segment["tokens"]
                 text = tokenizer.decode(tokens)
@@ -1777,9 +1765,7 @@ class WhisperModel:
 
 
 
-    def detect_hallucination(self, ngram_score: float, compression_rate: float, 
-                                ngram_threshold: float = 90.0, 
-                                compression_threshold: float = 15.0) -> bool:
+    def detect_hallucination(self, ngram_score, compression_rate, ngram_threshold=90.0,compression_threshold=15.0):
         """
         Detect hallucination using simple threshold-based approach.
         
@@ -1790,16 +1776,11 @@ class WhisperModel:
             compression_threshold: Threshold for compression rate (high values indicate repetition)
             is_chunk_level: Whether this is chunk-level detection (uses different thresholds)
             
-        Returns:
-            bool: True if hallucination detected, False otherwise
+        Returns: True if hallucination detected, False otherwise
         """
         
-        # Hallucination is detected if EITHER threshold is exceeded
-        # High n-gram score indicates repetitive/unusual text patterns
-        # High compression rate indicates highly repetitive content
+        #hallucination is detected if EITHER threshold is exceeded
         is_hallucination = ngram_score > ngram_threshold or compression_rate > compression_threshold
-        
-        
         return is_hallucination
 
     def get_prompt(
@@ -2113,8 +2094,7 @@ class WhisperModel:
 
         return language, language_probability, all_language_probs
 
-
-    def get_audio_chunk_for_segment(self, seek: int, segment_size: int) -> np.ndarray:
+    def get_audio_chunk_for_segment(self, seek, segment_size):
         """
         Extract the exact raw audio chunk corresponding to a mel spectrogram segment.
         
@@ -2122,37 +2102,35 @@ class WhisperModel:
             seek: Starting mel frame index
             segment_size: Number of mel frames in the segment
             
-        Returns:
-            Raw audio chunk as numpy array
+        Returns: Raw audio chunk as numpy array
         """
-        # Convert mel frame indices to audio sample indices
+        #convert mel frame indices to audio sample indices
         audio_start_sample = int(seek * self.feature_extractor.hop_length)
         audio_end_sample = int((seek + segment_size) * self.feature_extractor.hop_length)
         
-        # Extract the audio chunk
+        #extract the audio chunk
         audio_chunk = self.raw_audio[audio_start_sample:audio_end_sample]
         
         return audio_chunk
 
-    def convert_audio_to_features(self, enhanced_audio_chunk: np.ndarray) -> np.ndarray:
+
+    def convert_audio_to_features(self, enhanced_audio_chunk):
         """
         Convert audio chunk back to mel spectrogram features.
         
         Args:
             audio_chunk: Enhanced raw audio chunk as numpy array
             
-        Returns:
-            Mel spectrogram features as numpy array, padded/trimmed to expected size
+        Returns: Mel spectrogram features as numpy array padded/trimmed to expected size
         """
-        # Extract mel features from the enhanced audio using the model's feature extractor
+        #extract mel features from the enhanced audio using the model's feature extractor
         features = self.feature_extractor(enhanced_audio_chunk)
         
-        # Pad or trim to the expected size (usually 3000 mel frames)
+        #pad or trim to the expected size - 3000 mel frames by default.
         features = pad_or_trim(features)
-        
         return features
 
-    def get_segment_duration(self, seek: int, segment_size: int) -> float:
+    def get_segment_duration(self, seek, segment_size):
         """
         Calculate the duration in seconds of the current audio segment.
         
@@ -2160,14 +2138,13 @@ class WhisperModel:
             seek: Starting mel frame index
             segment_size: Number of mel frames in the segment
             
-        Returns:
-            Duration of the segment in seconds
+        Returns: Duration of the segment in seconds
         """
-        # Convert mel frame indices to audio sample indices
+        #convert mel frame indices to audio sample indices
         audio_start_sample = int(seek * self.feature_extractor.hop_length)
         audio_end_sample = int((seek + segment_size) * self.feature_extractor.hop_length)
         
-        # Calculate duration in seconds
+        #calculate duration in seconds
         duration_seconds = (audio_end_sample - audio_start_sample) / self.sampling_rate
         
         return duration_seconds
@@ -2339,7 +2316,7 @@ class WhisperModel:
                 })
             
             # Merge transcriptions with diarization timing
-            merged_result = self._merge_separated_transcriptions(all_transcriptions, diarization_result)
+            merged_result = self._merge_transcriptions(all_transcriptions, diarization_result)
             
             return merged_result
             
@@ -2361,7 +2338,7 @@ class WhisperModel:
                 except:
                     pass
 
-    def _merge_separated_transcriptions(self, transcriptions, diarization_result=None):
+    def _merge_transcriptions(self, transcriptions, diarization_result=None):
         """
         Merge transcriptions from separated speaker tracks based on timestamps and diarization.
         
@@ -2380,15 +2357,7 @@ class WhisperModel:
             trans = transcriptions[0]
             return trans['result'], trans['avg_logprob'], trans['temperature'], trans['compression_ratio']
         
-
-        return self._merge_transcriptions(transcriptions)
-
-
-
-    def _merge_transcriptions(self, transcriptions):
-        """
-        Simple fallback merging strategy.
-        """
+        # Simple fallback merging strategy for multiple speakers
         merged_text = ""
         best_result = None
         best_avg_logprob = float('-inf')

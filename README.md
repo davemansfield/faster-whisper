@@ -1,5 +1,63 @@
 [![CI](https://github.com/SYSTRAN/faster-whisper/workflows/CI/badge.svg)](https://github.com/SYSTRAN/faster-whisper/actions?query=workflow%3ACI) [![PyPI version](https://badge.fury.io/py/faster-whisper.svg)](https://badge.fury.io/py/faster-whisper)
 
+# Daves Additions
+The way I eventually implemented this was a wrapper around the actual model call rather than around the whole whisper software. This
+basically means that we still keep the whisper chunking and feature extraction and I have added a reprocessing loop if a Hallucination is
+detected using the n-gram and compression rate thresholds as we have discussed. Now the only *pre*-processing done in the pipeline is VAD, which requires saving the result as a tempfile, see examples.
+There is already a simular reprocessing loop that seems to work well in the faster-whisper software. This mainly takes place in the fuction `generate_with_fallback`.Their reprocessing here works like so:
+- By deafult temperature is set to a list of temperatures like `[0.0,0.2,0.4,0.6,0.8,1.0]`.
+- If a compression rate above the threshold is detected then it will increase the temperature to the next value in that list until an acceptable string is returned.
+- This is simular logic to our reprocessing, but is not deterministic and so we need to explicitly call temperature=0.0
+
+To maintain this functionality if needed I have placed the wrapper around this function meaning it will still occur if tempreature is not set explicitly. If we set temperature to 0.0 none of this reprocessing takes place and the text from the first pass is returned. Then we use our traffic light recovery to fix the hallu.
+- In `generate_segments` the model tries to generate a sensible translation by calling `generate_with_fallback`.
+- As described above when temp=0 this returns the first result without any reprocessing. 
+- Then if enable_hallucination_recovery is True i.e. we have the recovery pipeline turned on it will use the function `detect_hallucination` to check the metrics against some thresholds, which can be passed as parameters.
+- If `detect_hallucination` returns True then we run `_attempt_hallucination_recovery` which will continue to attempt to generate text without any hallucinations iterating through the discussed lights.
+
+### Config options added (added to WhisperModel class)
+enable_hallucination_recovery - bool
+max_beam_size - int
+min_beam_size - int
+ngram_threshold - float
+compression_threshold - float
+red_light - bool
+yellow_light - bool
+green_light - bool
+
+### Utility functions (added to WhisperModel class)
+**detect_hallucination** - Takes the full translated text from the model and checks the n-gram and compression score, if either of them pass their respective thresholds then returns True, a hallu is detected, else returns False.
+
+**convert_audio_to_features** - Some of the reprocessing models like convtasnet work on audio features and so cannot use the extracted features from whisper directly - this function converts them back into spectrograms for whisper after reprocessing.
+
+**get_audio_chunk_for_segment** - Get the audio from the features.
+
+**get_segment_duration** - I found that after chunking or VAD there can be very short segments left behind that always cause problems. This function just returns the legnth of a clip in seconds rather than frames as I found that more intuative to tune.
+
+
+### Recovery Functions (added to WhisperModel class)
+These function are use to recover a hallucination and are called in the following order if their light colour is turned on. All functions will try the recovery and then recall `generate_with_segments` with the new settings or audio.
+
+
+**_recovery_increase_beam_size** - Add two the current beam_size but max out at 7. The value can be tuned aswell as the init value. I start with 5.
+
+**_recovery_decrease_beam_size** - Subtract two from the current beam_size but stop at 3. The minimum value can be tuned but note that I added a decrease to 1 as I found that to work quite often.
+
+**_recovery_drop_beam_size** - Drops the beam_size to the min value of 1.
+
+**_recovery_vad_cleaning** - This isnt how we orignally concieved of the idea which was to essentially tune the VAD model already used by whisper. Since VAD only happens at the start before feature extraction we need to just run the VAD again but with more sensitive parameters than what is used for preprocessing. Currently it just uses the silero library rather than running the VAD script from the preprocessing package but this could be changed if needed.
+
+**_recovery_audio_enhancement** - Try to denoise the model using a given enhancement model which is set by deafault to convtasnet. Calls stuff from the preprocessing pipeline package to handle this. It was causing some memory issues so I added some code to clean cahce up. You might not have these on your end?
+
+**_recovery_speaker_separation** - The separation testing did not go to well. I assume that the models are not good enough to work on real data and they add too many artifacts or just stright up ruin the audio. Also some speakers are only speaking for a second or two which means more VAD would be needed which is only going to add more processing time. Probs not somthing we want in the main pipeline but worth retaining the code for spercific cases?
+
+**_merge_transcriptions** - Only needed with separation enabled. Since we process and translate multiple speaker tracks we get multiple transcripts which need to be mereged. We can maintain timestamps by using diarization.
+
+**_check_for_speaker_overlap** - This is only relevant with separation turned on. Checks for more than 1 speaker with a significant amount of overlapping speech using a diarization model. Allows us to skip the separation step in some cases.
+
+**_attempt_hallucination_recovery** - Runs through all the above recovery stratagies and checking for hallucinations in their results. Returns the orignal value if all fail. A possible alternative would be to return the best output from all the above.
+
+
 # Faster Whisper transcription with CTranslate2
 
 **faster-whisper** is a reimplementation of OpenAI's Whisper model using [CTranslate2](https://github.com/OpenNMT/CTranslate2/), which is a fast inference engine for Transformer models.

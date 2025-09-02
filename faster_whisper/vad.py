@@ -118,7 +118,7 @@ def get_speech_timestamps(
                 current_speech["end"] = prev_end
                 speeches.append(current_speech)
                 current_speech = {}
-                #previously reached silence (< neg_thres) and is still not speech (< thres)
+                # previously reached silence (< neg_thres) and is still not speech (< thres)
                 if next_start < prev_end:
                     triggered = False
                 else:
